@@ -2,9 +2,12 @@
 
 Mac Apple Silicon 原生算力/能效测试工具。
 
-## 构建
+## 下载（推荐）
+下载 `https://github.com/baicai-1145/MTFLOPS/releases/download/v1.0.0/MTFLOPS.zip` 并解压：
 ```bash
-make
+curl -L -o MTFLOPS.zip https://github.com/baicai-1145/MTFLOPS/releases/download/v1.0.0/MTFLOPS.zip
+unzip MTFLOPS.zip
+cd MTFLOPS
 ```
 
 ## 推荐一键跑分（GPU + 功耗 + 热降频提示）
