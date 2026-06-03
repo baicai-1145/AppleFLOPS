@@ -7,6 +7,7 @@ enum class GpuPrecision {
   FP32,
   FP16,
   BF16,
+  INT8,
 };
 
 enum class GpuKernelVariant {
@@ -43,7 +44,7 @@ struct GpuBenchOptions {
 
 struct GpuBenchResult {
   double best_seconds = 0.0;  // GPUStart/GPUEndTime 计算得到的 GPU 硬件时间
-  double tflops = 0.0;
+  double score = 0.0;  // FP/BF16: TFLOPS, INT8: TOPS
   GpuKernelVariant used_kernel = GpuKernelVariant::Auto;
 };
 

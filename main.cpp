@@ -17,14 +17,17 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <sys/sysctl.h>
 #include <unistd.h>
 #include <vector>
+
+#include <arm_neon.h>
 
 #include "gpu_bench.h"
 
 namespace {
 
-enum class Precision { NA, FP16, FP32, BF16 };
+enum class Precision { NA, FP16, FP32, BF16, INT8 };
 
 struct BenchRow {
   int n = 0;
@@ -51,8 +54,9 @@ struct Options {
   int warmup = 1;
   int repeats = 5;
   bool verify = true;
+  bool precision_set = false;
 
-  std::vector<GpuPrecision> gpu_precisions = {GpuPrecision::FP16};
+  std::vector<Precision> precisions;
   std::string gpu_shader_path = "shaders/gemm.metal";
   GpuKernel gpu_kernel = GpuKernel::Auto;
   GpuStorage gpu_storage = GpuStorage::Private;
@@ -96,22 +100,34 @@ bool parse_int(std::string_view s, int& out) {
 Precision precision_from_gpu(GpuPrecision p) {
   if (p == GpuPrecision::FP16) return Precision::FP16;
   if (p == GpuPrecision::FP32) return Precision::FP32;
-  return Precision::BF16;
+  if (p == GpuPrecision::BF16) return Precision::BF16;
+  return Precision::INT8;
 }
 
-int gpu_precision_index(GpuPrecision p) {
-  if (p == GpuPrecision::FP16) return 0;
-  if (p == GpuPrecision::FP32) return 1;
-  return 2;
+GpuPrecision gpu_precision_from_precision(Precision p) {
+  if (p == Precision::FP16) return GpuPrecision::FP16;
+  if (p == Precision::FP32) return GpuPrecision::FP32;
+  if (p == Precision::BF16) return GpuPrecision::BF16;
+  if (p == Precision::INT8) return GpuPrecision::INT8;
+  die("invalid GPU precision");
 }
 
-std::vector<GpuPrecision> parse_gpu_precisions(std::string_view v) {
-  if (v == "both") return {GpuPrecision::FP16, GpuPrecision::FP32};
-  if (v == "all") return {GpuPrecision::FP16, GpuPrecision::FP32, GpuPrecision::BF16};
-  if (v == "fp16") return {GpuPrecision::FP16};
-  if (v == "fp32") return {GpuPrecision::FP32};
-  if (v == "bf16") return {GpuPrecision::BF16};
-  die("--precision must be one of: fp16, fp32, bf16, both, all");
+int precision_index(Precision p) {
+  if (p == Precision::FP16) return 0;
+  if (p == Precision::FP32) return 1;
+  if (p == Precision::BF16) return 2;
+  if (p == Precision::INT8) return 3;
+  return 0;
+}
+
+std::vector<Precision> parse_precisions(std::string_view v) {
+  if (v == "both") return {Precision::FP16, Precision::FP32};
+  if (v == "all") return {Precision::FP16, Precision::FP32, Precision::BF16, Precision::INT8};
+  if (v == "fp16") return {Precision::FP16};
+  if (v == "fp32") return {Precision::FP32};
+  if (v == "bf16") return {Precision::BF16};
+  if (v == "int8" || v == "i8") return {Precision::INT8};
+  die("--precision must be one of: fp16, fp32, bf16, int8, both, all");
 }
 
 Options parse_args(int argc, char** argv) {
@@ -127,7 +143,7 @@ Options parse_args(int argc, char** argv) {
       std::cout
           << "MTFLOPS (Stage 1/2: CPU AMX + Metal GPU)\n\n"
           << "Usage:\n"
-          << "  ./mtflops [--unit cpu|gpu] [--mode amx|ref|both] [--precision fp16|fp32|bf16|both|all]\n"
+          << "  ./mtflops [--unit cpu|gpu] [--mode amx|ref|both] [--precision fp16|fp32|bf16|int8|both|all]\n"
           << "           [--n N] [--warmup W] [--repeats R] [--verify 0|1]\n"
           << "           [--shader <path>]\n\n"
           << "           [--sweep 0|1] [--sweep-min N] [--sweep-max N]\n"
@@ -138,8 +154,8 @@ Options parse_args(int argc, char** argv) {
           << "           [--gpu-inner I]  (I>1 为 compute-amplified，趋近理论峰值用)\n\n"
           << "           [--gpu-workload gemm|peak]\n\n"
           << "Notes:\n"
-          << "  - FLOPs 口径：GEMM 计算量按 2*N^3 计。\n"
-          << "  - AMX 路径通过 Accelerate 的 cblas_sgemm 触发。\n";
+          << "  - GEMM 口径：浮点按 2*N^3 计 TFLOPS；INT8 按 2*N^3 计 TOPS。\n"
+          << "  - FP32 AMX 路径通过 Accelerate 的 cblas_sgemm 触发；CPU FP16/INT8 优先使用 NEON，BF16 使用 verified typed kernel。\n";
       std::exit(0);
     } else if (a == "--unit") {
       auto v = need_value("--unit");
@@ -154,7 +170,8 @@ Options parse_args(int argc, char** argv) {
       else die("--mode must be one of: amx, ref, both");
     } else if (a == "--precision") {
       auto v = need_value("--precision");
-      opt.gpu_precisions = parse_gpu_precisions(v);
+      opt.precisions = parse_precisions(v);
+      opt.precision_set = true;
     } else if (a == "--kernel") {
       auto v = need_value("--kernel");
       if (v == "auto") opt.gpu_kernel = Options::GpuKernel::Auto;
@@ -225,6 +242,10 @@ Options parse_args(int argc, char** argv) {
       die(std::string("unknown arg: ") + std::string(a));
     }
   }
+  if (!opt.precision_set) {
+    opt.precisions = (opt.unit == Options::Unit::GPU) ? std::vector<Precision>{Precision::FP16}
+                                                      : std::vector<Precision>{Precision::FP32};
+  }
   return opt;
 }
 
@@ -237,19 +258,36 @@ T* aligned_alloc_64(size_t count) {
   return static_cast<T*>(p);
 }
 
-struct CpuBuffers {
-  float* a = nullptr;
-  float* b = nullptr;
-  float* c1 = nullptr;
-  float* c2 = nullptr;
+bool cpu_feature_enabled(const char* name) {
+  int v = 0;
+  size_t len = sizeof(v);
+  return sysctlbyname(name, &v, &len, nullptr, 0) == 0 && v != 0;
+}
 
-  ~CpuBuffers() {
-    std::free(a);
-    std::free(b);
-    std::free(c1);
-    std::free(c2);
+bool cpu_has_fp16() {
+  static const bool yes = cpu_feature_enabled("hw.optional.arm.FEAT_FP16");
+  return yes;
+}
+
+bool cpu_has_dotprod() {
+  static const bool yes = cpu_feature_enabled("hw.optional.arm.FEAT_DotProd");
+  return yes;
+}
+
+bool cpu_use_bf16_neon() {
+  // FEAT_BF16 is present on M4, but the current NEON BF16 dot layout is not
+  // trustworthy for row-major GEMM. Keep BF16 on the verified blocked path.
+  return false;
+}
+
+template <typename T>
+void transpose_square(const T* src, T* dst, int n) {
+  for (int i = 0; i < n; i++) {
+    for (int j = 0; j < n; j++) {
+      dst[static_cast<size_t>(j) * n + i] = src[static_cast<size_t>(i) * n + j];
+    }
   }
-};
+}
 
 void fill_matrix(float* m, int n, uint32_t seed) {
   // 固定 seed 的轻量初始化：避免跑分时随机数开销，且保证可复现。
@@ -295,6 +333,25 @@ void fill_matrix_bf16_as_float(float* m, int n, uint32_t seed) {
     x = x * 1664525u + 1013904223u;
     const float f = static_cast<float>((x >> 8) & 0x00FFFFFF) / static_cast<float>(0x01000000);
     m[i] = bf16_bits_to_float(float_to_bf16_bits(f));
+  }
+}
+
+void fill_matrix_bf16(uint16_t* m, int n, uint32_t seed) {
+  uint32_t x = seed ? seed : 1u;
+  const int nn = n * n;
+  for (int i = 0; i < nn; i++) {
+    x = x * 1664525u + 1013904223u;
+    const float f = static_cast<float>((x >> 8) & 0x00FFFFFF) / static_cast<float>(0x01000000);
+    m[i] = float_to_bf16_bits(f);
+  }
+}
+
+void fill_matrix_int8(int8_t* m, int n, uint32_t seed) {
+  uint32_t x = seed ? seed : 1u;
+  const int nn = n * n;
+  for (int i = 0; i < nn; i++) {
+    x = x * 1664525u + 1013904223u;
+    m[i] = static_cast<int8_t>(((x >> 24) & 0x0F) - 8);
   }
 }
 
@@ -346,13 +403,163 @@ void gemm_ref_blocked(const float* a, const float* b, float* c, int n) {
   }
 }
 
+void gemm_fp16_blocked(const __fp16* a, const __fp16* b, float* c, int n) {
+  constexpr int BS = 64;
+  std::fill(c, c + static_cast<size_t>(n) * static_cast<size_t>(n), 0.0f);
+
+  for (int ii = 0; ii < n; ii += BS) {
+    const int i_end = std::min(ii + BS, n);
+    for (int kk = 0; kk < n; kk += BS) {
+      const int k_end = std::min(kk + BS, n);
+      for (int jj = 0; jj < n; jj += BS) {
+        const int j_end = std::min(jj + BS, n);
+
+        for (int i = ii; i < i_end; i++) {
+          const __fp16* a_row = a + static_cast<size_t>(i) * n;
+          float* c_row = c + static_cast<size_t>(i) * n;
+          for (int k = kk; k < k_end; k++) {
+            const float a_ik = static_cast<float>(a_row[k]);
+            const __fp16* b_row = b + static_cast<size_t>(k) * n;
+            for (int j = jj; j < j_end; j++) {
+              c_row[j] += a_ik * static_cast<float>(b_row[j]);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+void gemm_bf16_blocked(const uint16_t* a, const uint16_t* b, float* c, int n) {
+  constexpr int BS = 64;
+  std::fill(c, c + static_cast<size_t>(n) * static_cast<size_t>(n), 0.0f);
+
+  for (int ii = 0; ii < n; ii += BS) {
+    const int i_end = std::min(ii + BS, n);
+    for (int kk = 0; kk < n; kk += BS) {
+      const int k_end = std::min(kk + BS, n);
+      for (int jj = 0; jj < n; jj += BS) {
+        const int j_end = std::min(jj + BS, n);
+
+        for (int i = ii; i < i_end; i++) {
+          const uint16_t* a_row = a + static_cast<size_t>(i) * n;
+          float* c_row = c + static_cast<size_t>(i) * n;
+          for (int k = kk; k < k_end; k++) {
+            const float a_ik = bf16_bits_to_float(a_row[k]);
+            const uint16_t* b_row = b + static_cast<size_t>(k) * n;
+            for (int j = jj; j < j_end; j++) {
+              c_row[j] += a_ik * bf16_bits_to_float(b_row[j]);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+void gemm_int8_blocked(const int8_t* a, const int8_t* b, int32_t* c, int n) {
+  constexpr int BS = 64;
+  std::fill(c, c + static_cast<size_t>(n) * static_cast<size_t>(n), 0);
+
+  for (int ii = 0; ii < n; ii += BS) {
+    const int i_end = std::min(ii + BS, n);
+    for (int kk = 0; kk < n; kk += BS) {
+      const int k_end = std::min(kk + BS, n);
+      for (int jj = 0; jj < n; jj += BS) {
+        const int j_end = std::min(jj + BS, n);
+
+        for (int i = ii; i < i_end; i++) {
+          const int8_t* a_row = a + static_cast<size_t>(i) * n;
+          int32_t* c_row = c + static_cast<size_t>(i) * n;
+          for (int k = kk; k < k_end; k++) {
+            const int32_t a_ik = static_cast<int32_t>(a_row[k]);
+            const int8_t* b_row = b + static_cast<size_t>(k) * n;
+            for (int j = jj; j < j_end; j++) {
+              c_row[j] += a_ik * static_cast<int32_t>(b_row[j]);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+void gemm_int8_ref_plain(const int8_t* a, const int8_t* b, int32_t* c, int n) {
+  const size_t nn = static_cast<size_t>(n) * static_cast<size_t>(n);
+  std::fill(c, c + nn, 0);
+  for (int i = 0; i < n; i++) {
+    const int8_t* a_row = a + static_cast<size_t>(i) * n;
+    int32_t* c_row = c + static_cast<size_t>(i) * n;
+    for (int k = 0; k < n; k++) {
+      const int32_t a_ik = static_cast<int32_t>(a_row[k]);
+      const int8_t* b_row = b + static_cast<size_t>(k) * n;
+      for (int j = 0; j < n; j++) {
+        c_row[j] += a_ik * static_cast<int32_t>(b_row[j]);
+      }
+    }
+  }
+}
+
+__attribute__((target("fullfp16")))
+float dot_fp16_neon(const __fp16* a, const __fp16* b, int n) {
+  float32x4_t acc = vdupq_n_f32(0.0f);
+  int k = 0;
+  for (; k + 8 <= n; k += 8) {
+    const auto av = vld1q_f16(reinterpret_cast<const float16_t*>(a + k));
+    const auto bv = vld1q_f16(reinterpret_cast<const float16_t*>(b + k));
+    acc = vfmlalq_low_f16(acc, av, bv);
+    acc = vfmlalq_high_f16(acc, av, bv);
+  }
+  float sum = vaddvq_f32(acc);
+  for (; k < n; k++) {
+    sum += static_cast<float>(a[k]) * static_cast<float>(b[k]);
+  }
+  return sum;
+}
+
+__attribute__((target("dotprod")))
+int32_t dot_int8_neon(const int8_t* a, const int8_t* b, int n) {
+  int32x4_t acc = vdupq_n_s32(0);
+  int k = 0;
+  for (; k + 16 <= n; k += 16) {
+    const int8x16_t av = vld1q_s8(a + k);
+    const int8x16_t bv = vld1q_s8(b + k);
+    acc = vdotq_s32(acc, av, bv);
+  }
+  int32_t sum = vaddvq_s32(acc);
+  for (; k < n; k++) {
+    sum += static_cast<int32_t>(a[k]) * static_cast<int32_t>(b[k]);
+  }
+  return sum;
+}
+
+void gemm_fp16_neon_pretransposed(const __fp16* a, const __fp16* bt, float* c, int n) {
+  for (int i = 0; i < n; i++) {
+    const __fp16* a_row = a + static_cast<size_t>(i) * n;
+    float* c_row = c + static_cast<size_t>(i) * n;
+    for (int j = 0; j < n; j++) {
+      c_row[j] = dot_fp16_neon(a_row, bt + static_cast<size_t>(j) * n, n);
+    }
+  }
+}
+
+void gemm_int8_neon_pretransposed(const int8_t* a, const int8_t* bt, int32_t* c, int n) {
+  for (int i = 0; i < n; i++) {
+    const int8_t* a_row = a + static_cast<size_t>(i) * n;
+    int32_t* c_row = c + static_cast<size_t>(i) * n;
+    for (int j = 0; j < n; j++) {
+      c_row[j] = dot_int8_neon(a_row, bt + static_cast<size_t>(j) * n, n);
+    }
+  }
+}
+
 double seconds_since(const std::chrono::high_resolution_clock::time_point& start,
                      const std::chrono::high_resolution_clock::time_point& end) {
   return std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
 }
 
 double tflops_for_gemm(int n, double seconds) {
-  // 2*N^3 FLOPs, -> TFLOPS
+  // 2*N^3 ops, -> 1e12 ops/s. Output label decides TFLOPS vs TOPS.
   const double nn = static_cast<double>(n);
   const double flops = 2.0 * nn * nn * nn;
   return flops / seconds / 1e12;
@@ -379,11 +586,39 @@ RunResult bench_gemm(Fn&& fn, const float* a, const float* b, float* c, int n, i
   return r;
 }
 
+template <typename Fn>
+RunResult bench_callable(Fn&& fn, int n, int warmup, int repeats) {
+  for (int i = 0; i < warmup; i++) fn();
+
+  double best = std::numeric_limits<double>::infinity();
+  for (int i = 0; i < repeats; i++) {
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    fn();
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    best = std::min(best, seconds_since(t0, t1));
+  }
+
+  RunResult r;
+  r.best_seconds = best;
+  r.tflops = tflops_for_gemm(n, best);
+  return r;
+}
+
 double max_abs_diff(const float* x, const float* y, int n) {
   const size_t nn = static_cast<size_t>(n) * static_cast<size_t>(n);
   double m = 0.0;
   for (size_t i = 0; i < nn; i++) {
     m = std::max(m, static_cast<double>(std::fabs(x[i] - y[i])));
+  }
+  return m;
+}
+
+int64_t max_abs_diff_i32(const int32_t* x, const int32_t* y, int n) {
+  const size_t nn = static_cast<size_t>(n) * static_cast<size_t>(n);
+  int64_t m = 0;
+  for (size_t i = 0; i < nn; i++) {
+    const int64_t d = static_cast<int64_t>(x[i]) - static_cast<int64_t>(y[i]);
+    m = std::max<int64_t>(m, std::llabs(d));
   }
   return m;
 }
@@ -417,8 +652,13 @@ std::string precision_to_string(Precision p) {
     case Precision::FP16: return "FP16";
     case Precision::FP32: return "FP32";
     case Precision::BF16: return "BF16";
+    case Precision::INT8: return "INT8";
   }
   return "-";
+}
+
+std::string metric_to_string(Precision p) {
+  return (p == Precision::INT8) ? "TOPS" : "TFLOPS";
 }
 
 std::optional<double> read_power_watts_powermetrics(std::string& note) {
@@ -499,9 +739,10 @@ void print_table_header(bool show_watts) {
             << std::setw(20) << "Unit"
             << std::setw(8) << "Prec"
             << std::setw(10) << "ms"
-            << std::setw(10) << "TFLOPS";
+            << std::setw(10) << "Score"
+            << std::setw(8) << "Metric";
   if (show_watts) {
-    std::cout << std::setw(10) << "Watts" << std::setw(12) << "GFLOPS/W";
+    std::cout << std::setw(10) << "Watts" << std::setw(12) << "GOPS/W";
   }
   std::cout << "Note\n";
 }
@@ -513,12 +754,13 @@ void print_row(const BenchRow& r, bool show_watts) {
             << std::setw(20) << r.unit
             << std::setw(8) << precision_to_string(r.precision)
             << std::setw(10) << std::fixed << std::setprecision(3) << ms
-            << std::setw(10) << std::fixed << std::setprecision(3) << r.tflops;
+            << std::setw(10) << std::fixed << std::setprecision(3) << r.tflops
+            << std::setw(8) << metric_to_string(r.precision);
 
   if (show_watts) {
     if (r.watts.has_value()) {
-      const double gflops = r.tflops * 1000.0;
-      const double eff = (*r.watts > 0.0) ? (gflops / *r.watts) : 0.0;
+      const double gops = r.tflops * 1000.0;
+      const double eff = (*r.watts > 0.0) ? (gops / *r.watts) : 0.0;
       std::cout << std::setw(10) << std::fixed << std::setprecision(2) << *r.watts
                 << std::setw(12) << std::fixed << std::setprecision(2) << eff;
     } else {
@@ -583,7 +825,7 @@ std::optional<SweetSpot> compute_sweet_spot(const std::vector<BenchRow>& rows, c
   }
   if (candidates.empty() || peak <= 0.0) return std::nullopt;
 
-  // 规则（KISS）：选“最小的 N”，其 TFLOPS ≥ 98% 峰值，且单次耗时 ≥ 2ms（避免计时过短噪声）。
+  // 规则（KISS）：选“最小的 N”，其 score ≥ 98% 峰值，且单次耗时 ≥ 2ms（避免计时过短噪声）。
   const double threshold = peak * 0.98;
   const double min_seconds = 0.002;
 
@@ -610,6 +852,102 @@ std::optional<SweetSpot> compute_sweet_spot(const std::vector<BenchRow>& rows, c
   return s;
 }
 
+bool verify_cpu_precision(Precision p, int n, double& diff, int64_t& diff_i32) {
+  const size_t nn = static_cast<size_t>(n) * static_cast<size_t>(n);
+  diff = 0.0;
+  diff_i32 = 0;
+
+  if (p == Precision::FP32) {
+    float* a = aligned_alloc_64<float>(nn);
+    float* b = aligned_alloc_64<float>(nn);
+    float* c1 = aligned_alloc_64<float>(nn);
+    float* c2 = aligned_alloc_64<float>(nn);
+    fill_matrix(a, n, 123);
+    fill_matrix(b, n, 456);
+    gemm_amx_accelerate(a, b, c1, n);
+    gemm_ref_blocked(a, b, c2, n);
+    diff = max_abs_diff(c1, c2, n);
+    std::free(a);
+    std::free(b);
+    std::free(c1);
+    std::free(c2);
+    return diff <= 1e-3;
+  }
+
+  if (p == Precision::FP16) {
+    __fp16* a16 = aligned_alloc_64<__fp16>(nn);
+    __fp16* b16 = aligned_alloc_64<__fp16>(nn);
+    __fp16* bt16 = aligned_alloc_64<__fp16>(nn);
+    float* c1 = aligned_alloc_64<float>(nn);
+    float* c2 = aligned_alloc_64<float>(nn);
+    float* a = aligned_alloc_64<float>(nn);
+    float* b = aligned_alloc_64<float>(nn);
+    fill_matrix_fp16(a16, n, 123);
+    fill_matrix_fp16(b16, n, 456);
+    transpose_square(b16, bt16, n);
+    for (size_t i = 0; i < nn; i++) {
+      a[i] = static_cast<float>(a16[i]);
+      b[i] = static_cast<float>(b16[i]);
+    }
+    if (cpu_has_fp16()) gemm_fp16_neon_pretransposed(a16, bt16, c1, n);
+    else gemm_fp16_blocked(a16, b16, c1, n);
+    gemm_ref_blocked(a, b, c2, n);
+    diff = max_abs_diff(c1, c2, n);
+    std::free(a16);
+    std::free(b16);
+    std::free(bt16);
+    std::free(c1);
+    std::free(c2);
+    std::free(a);
+    std::free(b);
+    return diff <= 1e-2;
+  }
+
+  if (p == Precision::BF16) {
+    uint16_t* a16 = aligned_alloc_64<uint16_t>(nn);
+    uint16_t* b16 = aligned_alloc_64<uint16_t>(nn);
+    float* c1 = aligned_alloc_64<float>(nn);
+    float* c2 = aligned_alloc_64<float>(nn);
+    float* a = aligned_alloc_64<float>(nn);
+    float* b = aligned_alloc_64<float>(nn);
+    fill_matrix_bf16(a16, n, 123);
+    fill_matrix_bf16(b16, n, 456);
+    for (size_t i = 0; i < nn; i++) {
+      a[i] = bf16_bits_to_float(a16[i]);
+      b[i] = bf16_bits_to_float(b16[i]);
+    }
+    gemm_bf16_blocked(a16, b16, c1, n);
+    gemm_ref_blocked(a, b, c2, n);
+    diff = max_abs_diff(c1, c2, n);
+    std::free(a16);
+    std::free(b16);
+    std::free(c1);
+    std::free(c2);
+    std::free(a);
+    std::free(b);
+    return diff <= 1e-2;
+  }
+
+  int8_t* a = aligned_alloc_64<int8_t>(nn);
+  int8_t* b = aligned_alloc_64<int8_t>(nn);
+  int8_t* bt = aligned_alloc_64<int8_t>(nn);
+  int32_t* c1 = aligned_alloc_64<int32_t>(nn);
+  int32_t* c2 = aligned_alloc_64<int32_t>(nn);
+  fill_matrix_int8(a, n, 123);
+  fill_matrix_int8(b, n, 456);
+  transpose_square(b, bt, n);
+  if (cpu_has_dotprod()) gemm_int8_neon_pretransposed(a, bt, c1, n);
+  else gemm_int8_blocked(a, b, c1, n);
+  gemm_int8_ref_plain(a, b, c2, n);
+  diff_i32 = max_abs_diff_i32(c1, c2, n);
+  std::free(a);
+  std::free(b);
+  std::free(bt);
+  std::free(c1);
+  std::free(c2);
+  return diff_i32 == 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -617,14 +955,14 @@ int main(int argc, char** argv) {
 
   print_logo();
   if (opt.unit == Options::Unit::GPU && opt.gpu_workload == Options::GpuWorkload::Peak) {
-    std::cout << "FLOPs: (N/8)^2 * batch * inner * 4 * 1024 (peak: 4-way 8x8x8 MMA per threadgroup)\n\n";
+    std::cout << "Peak score: FP/BF16 use matrix-unit FLOPs; INT8 uses a scalar TOPS probe.\n\n";
   } else {
-    std::cout << "FLOPs: 2*N^3 (GEMM multiply-add)\n\n";
+    std::cout << "GEMM score: 2*N^3 operations (FP/BF16 => TFLOPS, INT8 => TOPS)\n\n";
   }
   std::cout << std::flush;
 
   const int n = opt.n;
-  std::array<bool, 3> gpu_verified = {false, false, false};
+  std::array<bool, 4> gpu_verified = {false, false, false, false};
 
   auto get_watts = [&](std::string& note) -> std::optional<double> {
     if (opt.power == Options::Power::None) return std::nullopt;
@@ -648,7 +986,8 @@ int main(int argc, char** argv) {
     if (opt.gpu_kernel == Options::GpuKernel::V4) gopt.kernel = GpuKernelVariant::V4;
     else gopt.kernel = GpuKernelVariant::Auto;
 
-    const int pidx = gpu_precision_index(precision);
+    const Precision row_precision = precision_from_gpu(precision);
+    const int pidx = precision_index(row_precision);
     if (opt.verify && !gpu_verified[pidx] && gopt.workload == GpuWorkload::Gemm) {
       // KISS：仅校验一次小规模正确性，避免在 sweep/stress 中重复校验影响性能。
       const int vn = 128;
@@ -690,17 +1029,27 @@ int main(int argc, char** argv) {
           b[i] = static_cast<float>(b16[i]);
         }
         gemm_ref_blocked(a.data(), b.data(), ref_c.data(), vn);
-      } else {  // BF16: CPU 侧用“截断到 BF16 后再转回 float”的输入，匹配 GPU 读入。
+      } else if (precision == GpuPrecision::BF16) {
         std::vector<float> a(static_cast<size_t>(vn) * static_cast<size_t>(vn));
         std::vector<float> b(static_cast<size_t>(vn) * static_cast<size_t>(vn));
         fill_matrix_bf16_as_float(a.data(), vn, 1);
         fill_matrix_bf16_as_float(b.data(), vn, 2);
         gemm_ref_blocked(a.data(), b.data(), ref_c.data(), vn);
+      } else {
+        std::vector<int8_t> a(static_cast<size_t>(vn) * static_cast<size_t>(vn));
+        std::vector<int8_t> b(static_cast<size_t>(vn) * static_cast<size_t>(vn));
+        std::vector<int32_t> c(static_cast<size_t>(vn) * static_cast<size_t>(vn));
+        fill_matrix_int8(a.data(), vn, 1);
+        fill_matrix_int8(b.data(), vn, 2);
+        gemm_int8_blocked(a.data(), b.data(), c.data(), vn);
+        for (size_t i = 0; i < c.size(); i++) ref_c[i] = static_cast<float>(c[i]);
       }
 
       const double diff = max_abs_diff(ref_c.data(), gpu_c.data(), vn);
-      const double thr = (precision == GpuPrecision::FP32) ? 1e-2 : 1e-1;
-      std::cout << "verify(gpu): prec=" << precision_to_string(precision_from_gpu(precision))
+      const double thr = (precision == GpuPrecision::FP32) ? 1e-2
+                         : (precision == GpuPrecision::INT8) ? 0.0
+                                                            : 1e-1;
+      std::cout << "verify(gpu): prec=" << precision_to_string(row_precision)
                 << " N=" << vn << " max_abs_diff=" << std::scientific << diff << "\n\n";
       if (diff > thr) {
         err = "GPU verify max_abs_diff too high";
@@ -713,10 +1062,10 @@ int main(int argc, char** argv) {
     if (!run_gpu_bench(gopt, gout, err)) return false;
 
     row.n = size;
-    row.unit = "GPU (simdgroup)";
-    row.precision = precision_from_gpu(precision);
+    row.unit = (precision == GpuPrecision::INT8) ? "GPU (Metal)" : "GPU (simdgroup)";
+    row.precision = row_precision;
     row.seconds = gout.best_seconds;
-    row.tflops = gout.tflops;
+    row.tflops = gout.score;
     std::string k;
     if (gout.used_kernel == GpuKernelVariant::V4) k = "kernel=v4";
     if (!k.empty()) {
@@ -738,31 +1087,98 @@ int main(int argc, char** argv) {
     return true;
   };
 
-  auto run_one_cpu = [&](int size, Options::Mode mode, BenchRow& row, CpuBuffers& bufs) -> void {
+  auto run_one_cpu = [&](int size, Precision precision, Options::Mode mode, BenchRow& row) -> void {
     const size_t nn = static_cast<size_t>(size) * static_cast<size_t>(size);
-    if (!bufs.a) {
-      bufs.a = aligned_alloc_64<float>(nn);
-      bufs.b = aligned_alloc_64<float>(nn);
-      bufs.c1 = aligned_alloc_64<float>(nn);
-      bufs.c2 = aligned_alloc_64<float>(nn);
-      fill_matrix(bufs.a, size, 1);
-      fill_matrix(bufs.b, size, 2);
-    }
+    auto add_note = [&](std::string_view s) {
+      if (!row.note.empty()) row.note += " | ";
+      row.note += std::string(s);
+    };
 
     int repeats = opt.repeats;
-    if (mode == Options::Mode::Ref && size >= 1536 && opt.repeats > 1 && !opt.sweep) repeats = 1;
+    if ((mode == Options::Mode::Ref || precision != Precision::FP32) && size >= 1536 &&
+        opt.repeats > 1 && !opt.sweep) {
+      repeats = 1;
+    }
 
     RunResult r;
-    if (mode == Options::Mode::AMX) {
-      r = bench_gemm(gemm_amx_accelerate, bufs.a, bufs.b, bufs.c1, size, opt.warmup, repeats);
-      row.unit = "AMX (cblas)";
+    if (precision == Precision::FP32) {
+      float* a = aligned_alloc_64<float>(nn);
+      float* b = aligned_alloc_64<float>(nn);
+      float* c = aligned_alloc_64<float>(nn);
+      fill_matrix(a, size, 1);
+      fill_matrix(b, size, 2);
+      if (mode == Options::Mode::AMX) {
+        r = bench_gemm(gemm_amx_accelerate, a, b, c, size, opt.warmup, repeats);
+        row.unit = "AMX (cblas)";
+      } else {
+        r = bench_gemm(gemm_ref_blocked, a, b, c, size, opt.warmup, repeats);
+        row.unit = "CPU ref";
+      }
+      std::free(a);
+      std::free(b);
+      std::free(c);
+    } else if (precision == Precision::FP16) {
+      __fp16* a = aligned_alloc_64<__fp16>(nn);
+      __fp16* b = aligned_alloc_64<__fp16>(nn);
+      __fp16* bt = aligned_alloc_64<__fp16>(nn);
+      float* c = aligned_alloc_64<float>(nn);
+      fill_matrix_fp16(a, size, 1);
+      fill_matrix_fp16(b, size, 2);
+      transpose_square(b, bt, size);
+      const bool fast = cpu_has_fp16();
+      if (fast) {
+        r = bench_callable([&]() { gemm_fp16_neon_pretransposed(a, bt, c, size); }, size, opt.warmup,
+                           repeats);
+      } else {
+        r = bench_callable([&]() { gemm_fp16_blocked(a, b, c, size); }, size, opt.warmup, repeats);
+      }
+      row.unit = fast ? "CPU NEON" : "CPU kernel";
+      add_note("fp32 accumulate");
+      if (!fast) add_note("fallback=blocked");
+      std::free(a);
+      std::free(b);
+      std::free(bt);
+      std::free(c);
+    } else if (precision == Precision::BF16) {
+      uint16_t* a = aligned_alloc_64<uint16_t>(nn);
+      uint16_t* b = aligned_alloc_64<uint16_t>(nn);
+      float* c = aligned_alloc_64<float>(nn);
+      fill_matrix_bf16(a, size, 1);
+      fill_matrix_bf16(b, size, 2);
+      const bool fast = cpu_use_bf16_neon();
+      r = bench_callable([&]() { gemm_bf16_blocked(a, b, c, size); }, size, opt.warmup, repeats);
+      row.unit = fast ? "CPU NEON" : "CPU kernel";
+      add_note("fp32 accumulate");
+      if (!fast) add_note("fallback=blocked");
+      std::free(a);
+      std::free(b);
+      std::free(c);
     } else {
-      r = bench_gemm(gemm_ref_blocked, bufs.a, bufs.b, bufs.c2, size, opt.warmup, repeats);
-      row.unit = "CPU ref";
+      int8_t* a = aligned_alloc_64<int8_t>(nn);
+      int8_t* b = aligned_alloc_64<int8_t>(nn);
+      int8_t* bt = aligned_alloc_64<int8_t>(nn);
+      int32_t* c = aligned_alloc_64<int32_t>(nn);
+      fill_matrix_int8(a, size, 1);
+      fill_matrix_int8(b, size, 2);
+      transpose_square(b, bt, size);
+      const bool fast = cpu_has_dotprod();
+      if (fast) {
+        r = bench_callable([&]() { gemm_int8_neon_pretransposed(a, bt, c, size); }, size, opt.warmup,
+                           repeats);
+      } else {
+        r = bench_callable([&]() { gemm_int8_blocked(a, b, c, size); }, size, opt.warmup, repeats);
+      }
+      row.unit = fast ? "CPU NEON" : "CPU kernel";
+      add_note("int32 accumulate");
+      if (!fast) add_note("fallback=blocked");
+      std::free(a);
+      std::free(b);
+      std::free(bt);
+      std::free(c);
     }
 
     row.n = size;
-    row.precision = Precision::NA;
+    row.precision = precision;
     row.seconds = r.best_seconds;
     row.tflops = r.tflops;
   };
@@ -773,7 +1189,7 @@ int main(int argc, char** argv) {
     print_table_header(show_watts);
 
     std::vector<BenchRow> printed;
-    const size_t per_size = (opt.unit == Options::Unit::GPU) ? opt.gpu_precisions.size() : 2u;
+    const size_t per_size = opt.precisions.size() * 2u;
     printed.reserve(static_cast<size_t>(sizes.size()) * per_size);
 
     for (int size : sizes) {
@@ -782,13 +1198,13 @@ int main(int argc, char** argv) {
 
       if (opt.unit == Options::Unit::GPU) {
         bool stop = false;
-        for (GpuPrecision p : opt.gpu_precisions) {
+        for (Precision p : opt.precisions) {
           BenchRow row;
           row.n = size;
           row.watts = watts;
           row.note = note;
           std::string err;
-          if (!run_one_gpu(size, p, row, err)) {
+          if (!run_one_gpu(size, gpu_precision_from_precision(p), row, err)) {
             row.note = err;
             print_row(row, show_watts);
             printed.push_back(row);
@@ -801,47 +1217,44 @@ int main(int argc, char** argv) {
         if (stop) break;
       } else {
         std::cout << std::flush;
-        CpuBuffers bufs;
-        BenchRow base;
-        base.n = size;
-        base.watts = watts;
-        base.note = note;
-        // 每个 size 重新分配，避免超大内存长期占用。
-        if (opt.verify) {
-          const int vn = std::min(size, 128);
-          const size_t vnn = static_cast<size_t>(vn) * static_cast<size_t>(vn);
-          float* va = aligned_alloc_64<float>(vnn);
-          float* vb = aligned_alloc_64<float>(vnn);
-          float* vc1 = aligned_alloc_64<float>(vnn);
-          float* vc2 = aligned_alloc_64<float>(vnn);
-          fill_matrix(va, vn, 123);
-          fill_matrix(vb, vn, 456);
-          gemm_amx_accelerate(va, vb, vc1, vn);
-          gemm_ref_blocked(va, vb, vc2, vn);
-          const double diff = max_abs_diff(vc1, vc2, vn);
-          std::free(va);
-          std::free(vb);
-          std::free(vc1);
-          std::free(vc2);
-          if (diff > 1e-3) {
-            base.note = "verify max_abs_diff too high";
-          }
-        }
-
         const bool run_amx = (opt.mode == Options::Mode::AMX || opt.mode == Options::Mode::Both);
         const bool run_ref = (opt.mode == Options::Mode::Ref || opt.mode == Options::Mode::Both);
 
-        if (run_amx) {
-          BenchRow r1 = base;
-          run_one_cpu(size, Options::Mode::AMX, r1, bufs);
-          print_row(r1, show_watts);
-          printed.push_back(r1);
-        }
-        if (run_ref) {
-          BenchRow r2 = base;
-          run_one_cpu(size, Options::Mode::Ref, r2, bufs);
-          print_row(r2, show_watts);
-          printed.push_back(r2);
+        for (Precision p : opt.precisions) {
+          BenchRow base;
+          base.n = size;
+          base.watts = watts;
+          base.note = note;
+          if (opt.verify) {
+            const int vn = std::min(size, 128);
+            double diff = 0.0;
+            int64_t diff_i32 = 0;
+            if (!verify_cpu_precision(p, vn, diff, diff_i32)) {
+              if (!base.note.empty()) base.note += " | ";
+              base.note += (p == Precision::INT8) ? ("verify max_abs_diff_i32=" + std::to_string(diff_i32))
+                                                  : "verify max_abs_diff too high";
+            }
+          }
+
+          if (p == Precision::FP32) {
+            if (run_amx) {
+              BenchRow r1 = base;
+              run_one_cpu(size, p, Options::Mode::AMX, r1);
+              print_row(r1, show_watts);
+              printed.push_back(r1);
+            }
+            if (run_ref) {
+              BenchRow r2 = base;
+              run_one_cpu(size, p, Options::Mode::Ref, r2);
+              print_row(r2, show_watts);
+              printed.push_back(r2);
+            }
+          } else {
+            BenchRow r = base;
+            run_one_cpu(size, p, Options::Mode::AMX, r);
+            print_row(r, show_watts);
+            printed.push_back(r);
+          }
         }
         continue;
       }
@@ -850,12 +1263,25 @@ int main(int argc, char** argv) {
     // sweet spot 推荐（同一 unit+precision 下）
     std::vector<SweepKey> keys;
     if (opt.unit == Options::Unit::GPU) {
-      for (GpuPrecision p : opt.gpu_precisions) keys.push_back({"GPU (simdgroup)", precision_from_gpu(p)});
+      for (Precision p : opt.precisions) {
+        keys.push_back({(p == Precision::INT8) ? "GPU (Metal)" : "GPU (simdgroup)", p});
+      }
     } else {
-      keys.push_back({"AMX (cblas)", Precision::NA});
-    }
-    if (opt.unit == Options::Unit::CPU && (opt.mode == Options::Mode::Ref || opt.mode == Options::Mode::Both)) {
-      keys.push_back({"CPU ref", Precision::NA});
+      for (Precision p : opt.precisions) {
+        if (p == Precision::FP32) {
+          if (opt.mode == Options::Mode::AMX || opt.mode == Options::Mode::Both) {
+            keys.push_back({"AMX (cblas)", p});
+          }
+          if (opt.mode == Options::Mode::Ref || opt.mode == Options::Mode::Both) {
+            keys.push_back({"CPU ref", p});
+          }
+        } else {
+          const bool fast = (p == Precision::FP16) ? cpu_has_fp16()
+                            : (p == Precision::BF16) ? cpu_use_bf16_neon()
+                                                     : cpu_has_dotprod();
+          keys.push_back({fast ? "CPU NEON" : "CPU kernel", p});
+        }
+      }
     }
 
     bool printed_any = false;
@@ -868,7 +1294,8 @@ int main(int argc, char** argv) {
         const double pct = (ss->peak_tflops > 0.0) ? (ss->tflops / ss->peak_tflops * 100.0) : 0.0;
         std::cout << "- " << sweep_key_to_string(k) << " sweet spot N=" << ss->n
                   << " (" << std::fixed << std::setprecision(3) << ss->tflops
-                  << " TFLOPS, " << std::setprecision(1) << pct << "% of peak)\n";
+                  << " " << metric_to_string(k.precision) << ", " << std::setprecision(1)
+                  << pct << "% of peak)\n";
       }
     }
     return 0;
@@ -882,8 +1309,8 @@ int main(int argc, char** argv) {
     std::string cached_power_note;
 
     if (opt.unit == Options::Unit::GPU) {
-      std::array<double, 3> baseline = {0.0, 0.0, 0.0};
-      std::array<int, 3> throttle_streak = {0, 0, 0};
+      std::array<double, 4> baseline = {0.0, 0.0, 0.0, 0.0};
+      std::array<int, 4> throttle_streak = {0, 0, 0, 0};
 
       for (int iter = 0; iter < opt.stress; iter++) {
         std::string note;
@@ -895,7 +1322,7 @@ int main(int argc, char** argv) {
         }
 
         bool stop = false;
-        for (GpuPrecision p : opt.gpu_precisions) {
+        for (Precision p : opt.precisions) {
           BenchRow row;
           row.n = n;
           row.note = "iter=" + std::to_string(iter);
@@ -905,14 +1332,14 @@ int main(int argc, char** argv) {
           }
 
           std::string err;
-          if (!run_one_gpu(n, p, row, err)) {
+          if (!run_one_gpu(n, gpu_precision_from_precision(p), row, err)) {
             row.note = err;
             print_row(row, show_watts);
             stop = true;
             break;
           }
 
-          const int idx = gpu_precision_index(p);
+          const int idx = precision_index(p);
           baseline[idx] = std::max(baseline[idx], row.tflops);
           if (baseline[idx] > 0.0 && row.tflops < baseline[idx] * 0.9) throttle_streak[idx]++;
           else throttle_streak[idx] = 0;
@@ -924,108 +1351,98 @@ int main(int argc, char** argv) {
       return 0;
     }
 
-    // CPU stress：单 precision
-    double baseline = 0.0;
-    int throttle_streak = 0;
+    // CPU stress：每个 precision 跑一个主路径；FP32 优先 AMX，除非用户只选 ref。
+    std::array<double, 4> baseline = {0.0, 0.0, 0.0, 0.0};
+    std::array<int, 4> throttle_streak = {0, 0, 0, 0};
     for (int iter = 0; iter < opt.stress; iter++) {
-      BenchRow row;
-      row.n = n;
-      row.note = "iter=" + std::to_string(iter);
-
       std::string note;
       if (show_watts) {
         if (iter % opt.power_every == 0 || !cached_watts.has_value()) {
           cached_watts = get_watts(note);
           cached_power_note = note;
         }
-        row.watts = cached_watts;
-        if (!cached_power_note.empty()) row.note += " | " + cached_power_note;
       }
 
-      CpuBuffers bufs;
       const bool run_amx = (opt.mode == Options::Mode::AMX || opt.mode == Options::Mode::Both);
-      // stress 模式对 CPU 默认跑 AMX（避免 ref 太慢影响体验）
-      const auto which = run_amx ? Options::Mode::AMX : Options::Mode::Ref;
-      run_one_cpu(n, which, row, bufs);
+      for (Precision p : opt.precisions) {
+        BenchRow row;
+        row.n = n;
+        row.note = "iter=" + std::to_string(iter);
+        if (show_watts) {
+          row.watts = cached_watts;
+          if (!cached_power_note.empty()) row.note += " | " + cached_power_note;
+        }
 
-      baseline = std::max(baseline, row.tflops);
-      if (baseline > 0.0 && row.tflops < baseline * 0.9) throttle_streak++;
-      else throttle_streak = 0;
-      row.throttling = (throttle_streak >= 2);
-      print_row(row, show_watts);
+        const auto which = (p == Precision::FP32 && !run_amx) ? Options::Mode::Ref : Options::Mode::AMX;
+        run_one_cpu(n, p, which, row);
+
+        const int idx = precision_index(p);
+        baseline[idx] = std::max(baseline[idx], row.tflops);
+        if (baseline[idx] > 0.0 && row.tflops < baseline[idx] * 0.9) throttle_streak[idx]++;
+        else throttle_streak[idx] = 0;
+        row.throttling = (throttle_streak[idx] >= 2);
+        print_row(row, show_watts);
+      }
     }
     return 0;
   }
 
-  // 单次跑分（原行为）
   if (opt.unit == Options::Unit::GPU) {
-    for (GpuPrecision p : opt.gpu_precisions) {
+    print_table_header(false);
+    for (Precision p : opt.precisions) {
       BenchRow row;
       std::string err;
-      if (!run_one_gpu(n, p, row, err)) {
+      if (!run_one_gpu(n, gpu_precision_from_precision(p), row, err)) {
         std::cerr << "GPU benchmark failed: " << err << "\n";
         return 2;
       }
-      std::cout << "GPU (Metal simdgroup_matrix)  "
-                << "N=" << n
-                << "  precision=" << precision_to_string(row.precision)
-                << "  " << row.note
-                << "  best=" << std::fixed << std::setprecision(6) << row.seconds << " s"
-                << "  " << std::setprecision(3) << row.tflops << " TFLOPS\n";
+      print_row(row, false);
     }
     return 0;
   }
 
-  std::cout << "CPU (Accelerate AMX vs CPU ref)\n";
+  std::cout << "CPU (FP32 Accelerate cblas + NEON/typed kernels)\n";
   print_env_hint();
   std::cout << "\n";
-
-  const size_t nn = static_cast<size_t>(n) * static_cast<size_t>(n);
-  CpuBuffers bufs;
-  bufs.a = aligned_alloc_64<float>(nn);
-  bufs.b = aligned_alloc_64<float>(nn);
-  bufs.c1 = aligned_alloc_64<float>(nn);
-  bufs.c2 = aligned_alloc_64<float>(nn);
-  fill_matrix(bufs.a, n, 1);
-  fill_matrix(bufs.b, n, 2);
-
-  if (opt.verify) {
-    const int vn = std::min(n, 128);
-    const size_t vnn = static_cast<size_t>(vn) * static_cast<size_t>(vn);
-    float* va = aligned_alloc_64<float>(vnn);
-    float* vb = aligned_alloc_64<float>(vnn);
-    float* vc1 = aligned_alloc_64<float>(vnn);
-    float* vc2 = aligned_alloc_64<float>(vnn);
-    fill_matrix(va, vn, 123);
-    fill_matrix(vb, vn, 456);
-    gemm_amx_accelerate(va, vb, vc1, vn);
-    gemm_ref_blocked(va, vb, vc2, vn);
-    const double diff = max_abs_diff(vc1, vc2, vn);
-    std::cout << "verify: N=" << vn << " max_abs_diff=" << std::scientific << diff << "\n\n";
-    std::free(va);
-    std::free(vb);
-    std::free(vc1);
-    std::free(vc2);
-  }
 
   const bool run_amx = (opt.mode == Options::Mode::AMX || opt.mode == Options::Mode::Both);
   const bool run_ref = (opt.mode == Options::Mode::Ref || opt.mode == Options::Mode::Both);
 
-  if (run_amx) {
-    BenchRow row;
-    run_one_cpu(n, Options::Mode::AMX, row, bufs);
-    std::cout << std::left << std::setw(18) << row.unit
-              << "  N=" << std::setw(6) << n
-              << "  best=" << std::fixed << std::setprecision(6) << row.seconds << " s"
-              << "  " << std::setprecision(3) << row.tflops << " TFLOPS\n";
+  if (opt.verify) {
+    const int vn = std::min(n, 128);
+    for (Precision p : opt.precisions) {
+      double diff = 0.0;
+      int64_t diff_i32 = 0;
+      const bool ok = verify_cpu_precision(p, vn, diff, diff_i32);
+      std::cout << "verify(cpu): prec=" << precision_to_string(p) << " N=" << vn;
+      if (p == Precision::INT8) {
+        std::cout << " max_abs_diff_i32=" << diff_i32;
+      } else {
+        std::cout << " max_abs_diff=" << std::scientific << diff;
+      }
+      std::cout << (ok ? "\n" : " FAILED\n");
+    }
+    std::cout << "\n";
   }
-  if (run_ref) {
-    BenchRow row;
-    run_one_cpu(n, Options::Mode::Ref, row, bufs);
-    std::cout << std::left << std::setw(18) << row.unit
-              << "  N=" << std::setw(6) << n
-              << "  best=" << std::fixed << std::setprecision(6) << row.seconds << " s"
-              << "  " << std::setprecision(3) << row.tflops << " TFLOPS\n";
+
+  print_table_header(false);
+  for (Precision p : opt.precisions) {
+    if (p == Precision::FP32) {
+      if (run_amx) {
+        BenchRow row;
+        run_one_cpu(n, p, Options::Mode::AMX, row);
+        print_row(row, false);
+      }
+      if (run_ref) {
+        BenchRow row;
+        run_one_cpu(n, p, Options::Mode::Ref, row);
+        print_row(row, false);
+      }
+    } else {
+      BenchRow row;
+      run_one_cpu(n, p, Options::Mode::AMX, row);
+      print_row(row, false);
+    }
   }
 
   return 0;

@@ -7,7 +7,7 @@ using namespace metal;
 // - peak：compute-amplified 峰值探针（最小写回，逼近矩阵单元理论吞吐）
 //
 // 约束：
-// - v4：仅支持 N 为 32 的倍数
+// - FP/BF16 v4：仅支持 N 为 32 的倍数；INT8 v4 可处理任意正 N
 // - peak：要求 N 为 8 的倍数（grid=(N/8)x(N/8)）
 // - 输入/输出为 row-major 连续存储。
 //
@@ -345,9 +345,29 @@ kernel void gemm_bf16_v4(device const bfloat* A [[buffer(0)]],
 }
 #endif
 
+kernel void gemm_int8_v4(device const char* A [[buffer(0)]],
+                         device const char* B [[buffer(1)]],
+                         device float* C [[buffer(2)]],
+                         constant uint& N [[buffer(3)]],
+                         constant uint& inner [[buffer(4)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+  const uint col = gid.x;
+  const uint row = gid.y;
+  if (row >= N || col >= N) return;
+
+  int acc = 0;
+  for (uint r = 0; r < inner; r++) {
+    for (uint k = 0; k < N; k++) {
+      acc += int(A[row * N + k]) * int(B[k * N + col]);
+    }
+  }
+  C[row * N + col] = float(acc);
+}
+
 // ----------------
 // peak: compute-amplified (minimal writeback)
-// - 每个 threadgroup(1 simdgroup) 反复对固定 8x8 A/B 做 MMA，最后只写回 1 个标量。
+// - FP/BF16 每个 threadgroup 跑 4 个 simdgroup，反复对固定 8x8 A/B 做 MMA，
+//   最后只写回 1 个标量。
 // ----------------
 
 kernel void peak_fp32(device float* out [[buffer(0)]],
@@ -357,12 +377,13 @@ kernel void peak_fp32(device float* out [[buffer(0)]],
                       uint tid [[thread_index_in_threadgroup]]) {
   threadgroup float As[64];
   threadgroup float Bs[64];
-  for (uint i = tid; i < 64; i += 32) {
+  for (uint i = tid; i < 64; i += TG_THREADS) {
     As[i] = 1.0f + float(i & 7) * 0.001f;
     Bs[i] = 1.0f + float((i >> 3) & 7) * 0.001f;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
+  const uint sg = tid >> 5;
   simdgroup_matrix<float, 8, 8> a;
   simdgroup_matrix<float, 8, 8> b;
   simdgroup_load(a, As, 8);
@@ -381,15 +402,21 @@ kernel void peak_fp32(device float* out [[buffer(0)]],
   }
 
   // 写回时强制使用所有 accumulator，避免编译器 DCE 掉 acc1..acc3 导致 FLOPs 过计数。
-  threadgroup float tmp[64 * 4];
-  simdgroup_store(acc0, tmp + 64 * 0, 8);
-  simdgroup_store(acc1, tmp + 64 * 1, 8);
-  simdgroup_store(acc2, tmp + 64 * 2, 8);
-  simdgroup_store(acc3, tmp + 64 * 3, 8);
+  threadgroup float tmp[64 * 4 * 4];
+  const uint base = sg * 64 * 4;
+  simdgroup_store(acc0, tmp + base + 64 * 0, 8);
+  simdgroup_store(acc1, tmp + base + 64 * 1, 8);
+  simdgroup_store(acc2, tmp + base + 64 * 2, 8);
+  simdgroup_store(acc3, tmp + base + 64 * 3, 8);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid == 0) {
     const uint idx = tg_pos.y * tgpg.x + tg_pos.x;
-    out[idx] = tmp[0] + tmp[64] + tmp[128] + tmp[192];
+    float total = 0.0f;
+    for (uint s = 0; s < 4; s++) {
+      const uint sbase = s * 64 * 4;
+      total += tmp[sbase + 0] + tmp[sbase + 64] + tmp[sbase + 128] + tmp[sbase + 192];
+    }
+    out[idx] = total;
   }
 }
 
@@ -400,7 +427,7 @@ kernel void peak_fp16(device float* out [[buffer(0)]],
                       uint tid [[thread_index_in_threadgroup]]) {
   threadgroup half As[64];
   threadgroup half Bs[64];
-  for (uint i = tid; i < 64; i += 32) {
+  for (uint i = tid; i < 64; i += TG_THREADS) {
     const float av = 1.0f + float(i & 7) * 0.001f;
     const float bv = 1.0f + float((i >> 3) & 7) * 0.001f;
     As[i] = half(av);
@@ -408,6 +435,7 @@ kernel void peak_fp16(device float* out [[buffer(0)]],
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
+  const uint sg = tid >> 5;
   simdgroup_matrix<half, 8, 8> a;
   simdgroup_matrix<half, 8, 8> b;
   simdgroup_load(a, As, 8);
@@ -425,15 +453,21 @@ kernel void peak_fp16(device float* out [[buffer(0)]],
     simdgroup_multiply_accumulate(acc3, a, b, acc3);
   }
 
-  threadgroup float tmp[64 * 4];
-  simdgroup_store(acc0, tmp + 64 * 0, 8);
-  simdgroup_store(acc1, tmp + 64 * 1, 8);
-  simdgroup_store(acc2, tmp + 64 * 2, 8);
-  simdgroup_store(acc3, tmp + 64 * 3, 8);
+  threadgroup float tmp[64 * 4 * 4];
+  const uint base = sg * 64 * 4;
+  simdgroup_store(acc0, tmp + base + 64 * 0, 8);
+  simdgroup_store(acc1, tmp + base + 64 * 1, 8);
+  simdgroup_store(acc2, tmp + base + 64 * 2, 8);
+  simdgroup_store(acc3, tmp + base + 64 * 3, 8);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid == 0) {
     const uint idx = tg_pos.y * tgpg.x + tg_pos.x;
-    out[idx] = tmp[0] + tmp[64] + tmp[128] + tmp[192];
+    float total = 0.0f;
+    for (uint s = 0; s < 4; s++) {
+      const uint sbase = s * 64 * 4;
+      total += tmp[sbase + 0] + tmp[sbase + 64] + tmp[sbase + 128] + tmp[sbase + 192];
+    }
+    out[idx] = total;
   }
 }
 
@@ -445,7 +479,7 @@ kernel void peak_bf16(device float* out [[buffer(0)]],
                       uint tid [[thread_index_in_threadgroup]]) {
   threadgroup bfloat As[64];
   threadgroup bfloat Bs[64];
-  for (uint i = tid; i < 64; i += 32) {
+  for (uint i = tid; i < 64; i += TG_THREADS) {
     const float av = 1.0f + float(i & 7) * 0.001f;
     const float bv = 1.0f + float((i >> 3) & 7) * 0.001f;
     As[i] = (bfloat)av;
@@ -453,6 +487,7 @@ kernel void peak_bf16(device float* out [[buffer(0)]],
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
+  const uint sg = tid >> 5;
   simdgroup_matrix<bfloat, 8, 8> a;
   simdgroup_matrix<bfloat, 8, 8> b;
   simdgroup_load(a, As, 8);
@@ -470,15 +505,53 @@ kernel void peak_bf16(device float* out [[buffer(0)]],
     simdgroup_multiply_accumulate(acc3, a, b, acc3);
   }
 
-  threadgroup float tmp[64 * 4];
-  simdgroup_store(acc0, tmp + 64 * 0, 8);
-  simdgroup_store(acc1, tmp + 64 * 1, 8);
-  simdgroup_store(acc2, tmp + 64 * 2, 8);
-  simdgroup_store(acc3, tmp + 64 * 3, 8);
+  threadgroup float tmp[64 * 4 * 4];
+  const uint base = sg * 64 * 4;
+  simdgroup_store(acc0, tmp + base + 64 * 0, 8);
+  simdgroup_store(acc1, tmp + base + 64 * 1, 8);
+  simdgroup_store(acc2, tmp + base + 64 * 2, 8);
+  simdgroup_store(acc3, tmp + base + 64 * 3, 8);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid == 0) {
     const uint idx = tg_pos.y * tgpg.x + tg_pos.x;
-    out[idx] = tmp[0] + tmp[64] + tmp[128] + tmp[192];
+    float total = 0.0f;
+    for (uint s = 0; s < 4; s++) {
+      const uint sbase = s * 64 * 4;
+      total += tmp[sbase + 0] + tmp[sbase + 64] + tmp[sbase + 128] + tmp[sbase + 192];
+    }
+    out[idx] = total;
   }
 }
 #endif
+
+kernel void peak_int8(device float* out [[buffer(0)]],
+                      constant uint& inner [[buffer(1)]],
+                      uint3 tg_pos [[threadgroup_position_in_grid]],
+                      uint3 tgpg [[threadgroups_per_grid]],
+                      uint tid [[thread_index_in_threadgroup]]) {
+  int acc0 = 0;
+  int acc1 = 0;
+  int acc2 = 0;
+  int acc3 = 0;
+  for (uint r = 0; r < inner; r++) {
+    for (uint k = 0; k < 512; k++) {
+      const int a = int((k + tid) & 15) - 8;
+      const int b = int(((k >> 4) + tid) & 15) - 8;
+      acc0 += a * b;
+      acc1 += (a + 1) * b;
+      acc2 += a * (b - 1);
+      acc3 += (a + 1) * (b - 1);
+    }
+  }
+
+  threadgroup int tmp[32];
+  tmp[tid] = acc0 + acc1 + acc2 + acc3;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (tid == 0) {
+    int s = 0;
+    for (uint i = 0; i < 32; i++) s += tmp[i];
+    const uint idx = tg_pos.y * tgpg.x + tg_pos.x;
+    out[idx] = float(s);
+  }
+}

@@ -19,37 +19,44 @@ double tflops_for_gemm(int n, double seconds) {
   return flops / seconds / 1e12;
 }
 
-double tflops_for_gemm(int n, int batch, int inner, double seconds) {
+double score_for_gemm(int n, int batch, int inner, double seconds) {
   return static_cast<double>(batch) * static_cast<double>(inner) * tflops_for_gemm(n, seconds);
 }
 
-double tflops_for_peak(int n, int batch, int inner, double seconds) {
+double score_for_peak(GpuPrecision p, int n, int batch, int inner, double seconds) {
   // peak workload:
   // - grid: (n/8) x (n/8) threadgroups
-  // - each threadgroup does 4 accumulators * inner multiplies
+  // - FP/BF16: each threadgroup runs 4 simdgroups, each with 4 accumulators
+  //   * inner multiplies
   // - each 8x8x8 MMA = 1024 FLOPs
+  // INT8 peak uses a scalar 32-thread probe, so every thread contributes the same
+  // 4*512 MAC operations. GEMM INT8 remains the more representative workload.
   const double tg = static_cast<double>(n / 8) * static_cast<double>(n / 8);
-  const double flops = tg * static_cast<double>(batch) * static_cast<double>(inner) * 4.0 * 1024.0;
+  const double per_tg = (p == GpuPrecision::INT8) ? (32.0 * 4.0 * 1024.0) : (4.0 * 4.0 * 1024.0);
+  const double flops = tg * static_cast<double>(batch) * static_cast<double>(inner) * per_tg;
   return flops / seconds / 1e12;
 }
 static const char* kernel_name(GpuPrecision p, GpuKernelVariant k) {
-  const bool fp32 = (p == GpuPrecision::FP32);
   switch (k) {
     case GpuKernelVariant::V4:
       if (p == GpuPrecision::FP32) return "gemm_fp32_v4";
       if (p == GpuPrecision::FP16) return "gemm_fp16_v4";
-      return "gemm_bf16_v4";
+      if (p == GpuPrecision::BF16) return "gemm_bf16_v4";
+      return "gemm_int8_v4";
     case GpuKernelVariant::Auto:
       if (p == GpuPrecision::FP32) return "gemm_fp32_v4";
       if (p == GpuPrecision::FP16) return "gemm_fp16_v4";
-      return "gemm_bf16_v4";
+      if (p == GpuPrecision::BF16) return "gemm_bf16_v4";
+      return "gemm_int8_v4";
   }
-  if (fp32) return "gemm_fp32_v4";
+  if (p == GpuPrecision::FP32) return "gemm_fp32_v4";
   if (p == GpuPrecision::FP16) return "gemm_fp16_v4";
-  return "gemm_bf16_v4";
+  if (p == GpuPrecision::BF16) return "gemm_bf16_v4";
+  return "gemm_int8_v4";
 }
 
-static bool kernel_supported(int n, GpuKernelVariant k) {
+static bool kernel_supported(int n, GpuPrecision p, GpuKernelVariant k) {
+  if (p == GpuPrecision::INT8) return n > 0;
   if (k == GpuKernelVariant::V4) return (n % 32) == 0;
   // Auto：发布版仅保留 v4。
   return (n % 32) == 0;
@@ -100,6 +107,15 @@ static void fill_bf16(uint16_t* p, int n, uint32_t seed) {
   }
 }
 
+static void fill_int8(int8_t* p, int n, uint32_t seed) {
+  uint32_t x = seed ? seed : 1u;
+  const size_t nn = static_cast<size_t>(n) * static_cast<size_t>(n);
+  for (size_t i = 0; i < nn; i++) {
+    x = x * 1664525u + 1013904223u;
+    p[i] = static_cast<int8_t>(((x >> 24) & 0x0F) - 8);
+  }
+}
+
 static NSString* ns_error(NSError* e) {
   if (!e) return @"(nil)";
   return [NSString stringWithFormat:@"%@ (code=%ld)", e.localizedDescription, (long)e.code];
@@ -114,9 +130,11 @@ struct MetalCache {
   id<MTLComputePipelineState> pso_fp32_v4 = nil;
   id<MTLComputePipelineState> pso_fp16_v4 = nil;
   id<MTLComputePipelineState> pso_bf16_v4 = nil;
+  id<MTLComputePipelineState> pso_int8_v4 = nil;
   id<MTLComputePipelineState> pso_peak_fp32 = nil;
   id<MTLComputePipelineState> pso_peak_fp16 = nil;
   id<MTLComputePipelineState> pso_peak_bf16 = nil;
+  id<MTLComputePipelineState> pso_peak_int8 = nil;
 };
 
 static MetalCache& cache() {
@@ -129,6 +147,7 @@ static id<MTLComputePipelineState> cached_pso(GpuPrecision p, GpuKernelVariant k
   if (p == GpuPrecision::FP32 && k == GpuKernelVariant::V4) return c.pso_fp32_v4;
   if (p == GpuPrecision::FP16 && k == GpuKernelVariant::V4) return c.pso_fp16_v4;
   if (p == GpuPrecision::BF16 && k == GpuKernelVariant::V4) return c.pso_bf16_v4;
+  if (p == GpuPrecision::INT8 && k == GpuKernelVariant::V4) return c.pso_int8_v4;
   return nil;
 }
 
@@ -137,20 +156,23 @@ static void set_cached_pso(GpuPrecision p, GpuKernelVariant k, id<MTLComputePipe
   if (p == GpuPrecision::FP32 && k == GpuKernelVariant::V4) c.pso_fp32_v4 = pso;
   else if (p == GpuPrecision::FP16 && k == GpuKernelVariant::V4) c.pso_fp16_v4 = pso;
   else if (p == GpuPrecision::BF16 && k == GpuKernelVariant::V4) c.pso_bf16_v4 = pso;
+  else if (p == GpuPrecision::INT8 && k == GpuKernelVariant::V4) c.pso_int8_v4 = pso;
 }
 
 static id<MTLComputePipelineState> cached_peak_pso(GpuPrecision p) {
   auto& c = cache();
   if (p == GpuPrecision::FP32) return c.pso_peak_fp32;
   if (p == GpuPrecision::FP16) return c.pso_peak_fp16;
-  return c.pso_peak_bf16;
+  if (p == GpuPrecision::BF16) return c.pso_peak_bf16;
+  return c.pso_peak_int8;
 }
 
 static void set_cached_peak_pso(GpuPrecision p, id<MTLComputePipelineState> pso) {
   auto& c = cache();
   if (p == GpuPrecision::FP32) c.pso_peak_fp32 = pso;
   else if (p == GpuPrecision::FP16) c.pso_peak_fp16 = pso;
-  else c.pso_peak_bf16 = pso;
+  else if (p == GpuPrecision::BF16) c.pso_peak_bf16 = pso;
+  else c.pso_peak_int8 = pso;
 }
 
 }  // namespace
@@ -161,7 +183,7 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
       error = "n must be > 0";
       return false;
     }
-    if (opt.workload == GpuWorkload::Gemm && !kernel_supported(opt.n, opt.kernel)) {
+    if (opt.workload == GpuWorkload::Gemm && !kernel_supported(opt.n, opt.precision, opt.kernel)) {
       error = "GPU kernel v4 requires N multiple of 32";
       return false;
     }
@@ -233,8 +255,9 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
       c.pso_fp32_v4 = nil;
       c.pso_fp16_v4 = nil;
       c.pso_bf16_v4 = nil;
+      c.pso_int8_v4 = nil;
       c.pso_peak_fp32 = c.pso_peak_fp16 = nil;
-      c.pso_peak_bf16 = nil;
+      c.pso_peak_bf16 = c.pso_peak_int8 = nil;
     }
     id<MTLLibrary> lib = c.lib;
 
@@ -249,6 +272,14 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
     const size_t bytes_fp32 = static_cast<size_t>(n) * static_cast<size_t>(n) * sizeof(float);
     const size_t bytes_fp16 = static_cast<size_t>(n) * static_cast<size_t>(n) * sizeof(__fp16);
     const size_t bytes_bf16 = static_cast<size_t>(n) * static_cast<size_t>(n) * sizeof(uint16_t);
+    const size_t bytes_int8 = static_cast<size_t>(n) * static_cast<size_t>(n) * sizeof(int8_t);
+
+    auto input_bytes = [&]() -> size_t {
+      if (opt.precision == GpuPrecision::FP32) return bytes_fp32;
+      if (opt.precision == GpuPrecision::FP16) return bytes_fp16;
+      if (opt.precision == GpuPrecision::BF16) return bytes_bf16;
+      return bytes_int8;
+    };
 
     const bool use_private = (opt.storage == GpuStorageMode::Private);
     id<MTLBuffer> bufA = nil;
@@ -300,7 +331,7 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
       __fp16* b = reinterpret_cast<__fp16*>((use_private ? stageB : bufB).contents);
       fill_fp16(a, n, 1);
       fill_fp16(b, n, 2);
-    } else {  // BF16
+    } else if (opt.precision == GpuPrecision::BF16) {
       if (use_private) {
         stageA = [device newBufferWithLength:bytes_bf16 options:shared];
         stageB = [device newBufferWithLength:bytes_bf16 options:shared];
@@ -320,6 +351,26 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
       uint16_t* b = reinterpret_cast<uint16_t*>((use_private ? stageB : bufB).contents);
       fill_bf16(a, n, 1);
       fill_bf16(b, n, 2);
+    } else {  // INT8
+      if (use_private) {
+        stageA = [device newBufferWithLength:bytes_int8 options:shared];
+        stageB = [device newBufferWithLength:bytes_int8 options:shared];
+        bufA = [device newBufferWithLength:bytes_int8 options:priv];
+        bufB = [device newBufferWithLength:bytes_int8 options:priv];
+        bufC = [device newBufferWithLength:bytes_fp32 options:priv];
+      } else {
+        bufA = [device newBufferWithLength:bytes_int8 options:shared];
+        bufB = [device newBufferWithLength:bytes_int8 options:shared];
+        bufC = [device newBufferWithLength:bytes_fp32 options:shared];
+      }
+      if (!bufA || !bufB || !bufC || (use_private && (!stageA || !stageB))) {
+        error = "failed to allocate MTLBuffers (int8)";
+        return false;
+      }
+      int8_t* a = reinterpret_cast<int8_t*>((use_private ? stageA : bufA).contents);
+      int8_t* b = reinterpret_cast<int8_t*>((use_private ? stageB : bufB).contents);
+      fill_int8(a, n, 1);
+      fill_int8(b, n, 2);
     }
 
     const uint32_t N_u32 = static_cast<uint32_t>(n);
@@ -340,7 +391,8 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
       if (auto pso = cached_peak_pso(opt.precision)) return pso;
       const char* name = (opt.precision == GpuPrecision::FP32) ? "peak_fp32"
                           : (opt.precision == GpuPrecision::FP16) ? "peak_fp16"
-                                                                  : "peak_bf16";
+                          : (opt.precision == GpuPrecision::BF16) ? "peak_bf16"
+                                                                  : "peak_int8";
       NSString* fnName = [NSString stringWithUTF8String:name];
       id<MTLFunction> fn = [lib newFunctionWithName:fnName];
       if (!fn) return nil;
@@ -360,12 +412,12 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
       [enc setBytes:&inner_u32 length:sizeof(inner_u32) atIndex:4];
 
       (void)k;
-      const int tile = 32;
-      const NSUInteger threads = 128;
-      const MTLSize tg = MTLSizeMake(static_cast<NSUInteger>(n / tile),
-                                     static_cast<NSUInteger>(n / tile),
+      const bool int8 = (opt.precision == GpuPrecision::INT8);
+      const int tile = int8 ? 16 : 32;
+      const MTLSize tg = MTLSizeMake(static_cast<NSUInteger>((n + tile - 1) / tile),
+                                     static_cast<NSUInteger>((n + tile - 1) / tile),
                                      1);
-      const MTLSize th = MTLSizeMake(threads, 1, 1);
+      const MTLSize th = int8 ? MTLSizeMake(16, 16, 1) : MTLSizeMake(128, 1, 1);
       for (int i = 0; i < opt.batch; i++) {
         [enc dispatchThreadgroups:tg threadsPerThreadgroup:th];
       }
@@ -383,7 +435,8 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
       const MTLSize tg = MTLSizeMake(static_cast<NSUInteger>(n / tile),
                                      static_cast<NSUInteger>(n / tile),
                                      1);
-      const MTLSize th = MTLSizeMake(32, 1, 1);
+      const bool int8 = (opt.precision == GpuPrecision::INT8);
+      const MTLSize th = int8 ? MTLSizeMake(32, 1, 1) : MTLSizeMake(128, 1, 1);
       for (int i = 0; i < opt.batch; i++) {
         [enc dispatchThreadgroups:tg threadsPerThreadgroup:th];
       }
@@ -401,8 +454,8 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
       // 把 A/B staging 拷贝到 private buffer（单独 command buffer，避免计入测量）。
       id<MTLCommandBuffer> cb = [queue commandBuffer];
       id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-      const size_t bytes_a = (opt.precision == GpuPrecision::FP32) ? bytes_fp32 : bytes_fp16;
-      const size_t bytes_b = (opt.precision == GpuPrecision::FP32) ? bytes_fp32 : bytes_fp16;
+      const size_t bytes_a = input_bytes();
+      const size_t bytes_b = input_bytes();
       [blit copyFromBuffer:stageA sourceOffset:0 toBuffer:bufA destinationOffset:0 size:bytes_a];
       [blit copyFromBuffer:stageB sourceOffset:0 toBuffer:bufB destinationOffset:0 size:bytes_b];
       [blit endEncoding];
@@ -421,7 +474,8 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
                 std::string([[ns_error(nsErr) description] UTF8String]) + ")";
         return false;
       }
-      if (pso.maxTotalThreadsPerThreadgroup < 32) {
+      const NSUInteger needed_threads = (opt.precision == GpuPrecision::INT8) ? 32 : 128;
+      if (pso.maxTotalThreadsPerThreadgroup < needed_threads) {
         error = "peak pipeline maxTotalThreadsPerThreadgroup too small";
         return false;
       }
@@ -473,7 +527,7 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
       double best = 0.0;
       if (!measure_peak(opt.warmup, opt.repeats, best)) return false;
       out.best_seconds = best;
-      out.tflops = tflops_for_peak(n, opt.batch, opt.inner, best);
+      out.score = score_for_peak(opt.precision, n, opt.batch, opt.inner, best);
       out.used_kernel = GpuKernelVariant::Auto;
       return true;
     }
@@ -491,7 +545,7 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
       }
 
       (void)k;
-      const NSUInteger needed_threads = 128;
+      const NSUInteger needed_threads = (opt.precision == GpuPrecision::INT8) ? 256 : 128;
       if (pso.maxTotalThreadsPerThreadgroup < needed_threads) {
         error = "pipeline maxTotalThreadsPerThreadgroup too small for selected kernel";
         return false;
@@ -540,7 +594,7 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
     if (!measure(chosen, opt.warmup, opt.repeats, best)) return false;
 
     out.best_seconds = best;
-    out.tflops = tflops_for_gemm(n, opt.batch, opt.inner, best);
+    out.score = score_for_gemm(n, opt.batch, opt.inner, best);
     out.used_kernel = chosen;
 
     if (opt.readback_c) {
