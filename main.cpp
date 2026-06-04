@@ -16,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <pthread.h>
 #include <string>
 #include <string_view>
 #include <sys/sysctl.h>
@@ -24,6 +25,8 @@
 #include <vector>
 
 #include <arm_neon.h>
+#include <arm_sme.h>
+#include <arm_sve.h>
 
 #include "gpu_bench.h"
 #include "npu_bench.h"
@@ -58,6 +61,7 @@ struct Options {
   int repeats = 5;
   bool verify = true;
   bool precision_set = false;
+  std::string precision_arg;
   bool n_set = false;
 
   std::vector<Precision> precisions;
@@ -120,7 +124,7 @@ GpuPrecision gpu_precision_from_precision(Precision p) {
 
 NpuPrecision npu_precision_from_precision(Precision p) {
   if (p == Precision::FP16) return NpuPrecision::FP16;
-  if (p == Precision::FP32) return NpuPrecision::FP32;
+  if (p == Precision::FP32) die("NPU FP32 score is disabled: ANE does not expose native FP32 compute");
   if (p == Precision::BF16) return NpuPrecision::BF16;
   if (p == Precision::INT8) return NpuPrecision::INT8;
   die("invalid NPU precision");
@@ -155,7 +159,7 @@ Options parse_args(int argc, char** argv) {
 
     if (a == "-h" || a == "--help") {
       std::cout
-          << "MTFLOPS (Stage 1/2: CPU AMX + Metal GPU)\n\n"
+          << "MTFLOPS (CPU SME + Metal GPU + private ANE)\n\n"
           << "Usage:\n"
           << "  ./mtflops [--unit cpu|gpu|npu] [--mode amx|ref|both] [--precision fp16|fp32|bf16|int8|both|all]\n"
           << "           [--n N] [--warmup W] [--repeats R] [--verify 0|1]\n"
@@ -169,10 +173,9 @@ Options parse_args(int argc, char** argv) {
           << "           [--gpu-workload gemm|peak]\n\n"
           << "           [--npu-spatial S] [--npu-depth D]\n\n"
           << "Notes:\n"
-          << "  - GEMM 口径：浮点按 2*N^3 计 TFLOPS；INT8 按 2*N^3 计 TOPS。\n"
-          << "  - FP32 AMX 路径通过 Accelerate 的 cblas_sgemm 触发；CPU FP16 使用 NEON，BF16 使用 verified typed kernel。\n"
-          << "  - CPU INT8 使用 I8MM tiled GEMM microkernel；无 I8MM 时退回 verified scalar GEMM。\n"
-          << "  - NPU 使用 private ANE conv1x1-chain：N=channels，--npu-spatial/--npu-depth 控制工作量。\n";
+          << "  - CPU 口径：SME MOPA peak probe；N 控制 inner loop 规模，不再走 Accelerate/NEON/I8MM GEMM。\n"
+          << "  - GPU GEMM 口径：浮点按 2*N^3 计 TFLOPS；INT8 按 2*N^3 计 TOPS。\n"
+          << "  - NPU 使用 private ANE conv1x1-chain：只报告 FP16/INT8；N=channels，--npu-spatial/--npu-depth 控制工作量。\n";
       std::exit(0);
     } else if (a == "--unit") {
       auto v = need_value("--unit");
@@ -188,6 +191,7 @@ Options parse_args(int argc, char** argv) {
       else die("--mode must be one of: amx, ref, both");
     } else if (a == "--precision") {
       auto v = need_value("--precision");
+      opt.precision_arg = std::string(v);
       opt.precisions = parse_precisions(v);
       opt.precision_set = true;
     } else if (a == "--kernel") {
@@ -273,6 +277,16 @@ Options parse_args(int argc, char** argv) {
     if (opt.unit == Options::Unit::GPU) opt.precisions = {Precision::FP16};
     else if (opt.unit == Options::Unit::NPU) opt.precisions = {Precision::FP16, Precision::INT8};
     else opt.precisions = {Precision::FP32};
+  } else if (opt.unit == Options::Unit::NPU) {
+    if (opt.precision_arg == "all" || opt.precision_arg == "both") {
+      opt.precisions = {Precision::FP16, Precision::INT8};
+    } else {
+      for (Precision p : opt.precisions) {
+        if (p == Precision::FP32) {
+          die("NPU FP32 score is disabled: true FP32 ANE conv is not accepted; use fp16 or int8");
+        }
+      }
+    }
   }
   if (opt.unit == Options::Unit::NPU && !opt.n_set) opt.n = 512;
   return opt;
@@ -303,7 +317,7 @@ bool cpu_has_i8mm() {
   return yes;
 }
 
-bool cpu_use_bf16_neon() {
+[[maybe_unused]] bool cpu_use_bf16_neon() {
   // FEAT_BF16 is present on M4, but the current NEON BF16 dot layout is not
   // trustworthy for row-major GEMM. Keep BF16 on the verified blocked path.
   return false;
@@ -725,14 +739,14 @@ double seconds_since(const std::chrono::high_resolution_clock::time_point& start
   return std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
 }
 
-double tflops_for_gemm(int n, double seconds) {
+[[maybe_unused]] double tflops_for_gemm(int n, double seconds) {
   // 2*N^3 ops, -> 1e12 ops/s. Output label decides TFLOPS vs TOPS.
   const double nn = static_cast<double>(n);
   const double flops = 2.0 * nn * nn * nn;
   return flops / seconds / 1e12;
 }
 
-uint64_t ops_for_gemm_u64(int n) {
+[[maybe_unused]] uint64_t ops_for_gemm_u64(int n) {
   const uint64_t nn = static_cast<uint64_t>(n);
   return 2ull * nn * nn * nn;
 }
@@ -743,6 +757,378 @@ struct RunResult {
   uint64_t ops = 0;
   int threads = 1;
 };
+
+constexpr size_t kSmePeakScratchElems = 4096;
+constexpr size_t kSmePeakTileElems = 65536;
+constexpr uint64_t kSmePeakIterScale = 16384;
+constexpr uint64_t kSmePeakMaxInner = 1ull << 28;
+
+int cpu_sme_thread_count() {
+  if (const char* env = std::getenv("MTFLOPS_CPU_THREADS")) {
+    int v = 0;
+    if (parse_int(env, v) && v > 0) return v;
+  }
+  const unsigned hc = std::thread::hardware_concurrency();
+  return static_cast<int>(std::max(1u, hc) * 6u);
+}
+
+void set_cpu_sme_worker_qos() {
+#if defined(__APPLE__)
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
+
+uint64_t cpu_sme_peak_inner_from_n(int n) {
+  const uint64_t nn = static_cast<uint64_t>(std::max(1, n));
+  return std::min(nn * kSmePeakIterScale, kSmePeakMaxInner);
+}
+
+uint16_t fp32_to_bf16_peak_bits(float f) {
+  return float_to_bf16_bits(f);
+}
+
+// These kernels are intentionally peak probes, not full GEMM kernels. They run the
+// public SME outer-product instructions directly with stable in-register inputs.
+__arm_new("za") __arm_locally_streaming __attribute__((target("sme,bf16,i8mm"), noinline))
+void cpu_sme_peak_fp32_kernel(const float* a, const float* b, float* out, uint64_t inner,
+                              uint64_t* ops_per_mopa, uint32_t* lanes32) {
+  const svbool_t pg = svptrue_b32();
+  const svfloat32_t va = svld1_f32(pg, a);
+  const svfloat32_t vb = svld1_f32(pg, b);
+  const uint64_t n32 = svcntsw();
+  *lanes32 = static_cast<uint32_t>(n32);
+  *ops_per_mopa = 2ull * n32 * n32;
+  svzero_za();
+  for (uint64_t i = 0; i < inner; i++) {
+    svmopa_za32_m(0, pg, pg, va, vb);
+  }
+  for (uint32_t r = 0; r < n32; r++) {
+    svst1_hor_za32(0, r, pg, out + static_cast<size_t>(r) * n32);
+  }
+}
+
+__arm_new("za") __arm_locally_streaming __attribute__((target("sme,bf16,i8mm"), noinline))
+void cpu_sme_peak_fp16_kernel(const __fp16* a, const __fp16* b, float* out, uint64_t inner,
+                              uint64_t* ops_per_mopa, uint32_t* lanes32) {
+  const svbool_t pg16 = svptrue_b16();
+  const svbool_t pg32 = svptrue_b32();
+  const svfloat16_t va = svld1_f16(pg16, a);
+  const svfloat16_t vb = svld1_f16(pg16, b);
+  const uint64_t n32 = svcntsw();
+  *lanes32 = static_cast<uint32_t>(n32);
+  *ops_per_mopa = 4ull * n32 * n32;  // 2 FP16 K lanes per FP32 tile cell, GEMM counts mul+add.
+  svzero_za();
+  for (uint64_t i = 0; i < inner; i++) {
+    svmopa_za32_m(0, pg16, pg16, va, vb);
+  }
+  for (uint32_t r = 0; r < n32; r++) {
+    svst1_hor_za32(0, r, pg32, out + static_cast<size_t>(r) * n32);
+  }
+}
+
+__arm_new("za") __arm_locally_streaming __attribute__((target("sme,bf16,i8mm"), noinline))
+void cpu_sme_peak_bf16_kernel(const bfloat16_t* a, const bfloat16_t* b, float* out, uint64_t inner,
+                              uint64_t* ops_per_mopa, uint32_t* lanes32) {
+  const svbool_t pg16 = svptrue_b16();
+  const svbool_t pg32 = svptrue_b32();
+  const svbfloat16_t va = svld1_bf16(pg16, a);
+  const svbfloat16_t vb = svld1_bf16(pg16, b);
+  const uint64_t n32 = svcntsw();
+  *lanes32 = static_cast<uint32_t>(n32);
+  *ops_per_mopa = 4ull * n32 * n32;  // 2 BF16 K lanes per FP32 tile cell, GEMM counts mul+add.
+  svzero_za();
+  for (uint64_t i = 0; i < inner; i++) {
+    svmopa_za32_m(0, pg16, pg16, va, vb);
+  }
+  for (uint32_t r = 0; r < n32; r++) {
+    svst1_hor_za32(0, r, pg32, out + static_cast<size_t>(r) * n32);
+  }
+}
+
+__arm_new("za") __arm_locally_streaming __attribute__((target("sme,bf16,i8mm"), noinline))
+void cpu_sme_peak_int8_kernel(const int8_t* a, const int8_t* b, int32_t* out, uint64_t inner,
+                              uint64_t* ops_per_mopa, uint32_t* lanes32) {
+  const svbool_t pg8 = svptrue_b8();
+  const svbool_t pg32 = svptrue_b32();
+  const svint8_t va = svld1_s8(pg8, a);
+  const svint8_t vb = svld1_s8(pg8, b);
+  const uint64_t n32 = svcntsw();
+  *lanes32 = static_cast<uint32_t>(n32);
+  *ops_per_mopa = 8ull * n32 * n32;  // 4 INT8 K lanes per INT32 tile cell, TOPS counts mul+add.
+  svzero_za();
+  for (uint64_t i = 0; i < inner; i++) {
+    svmopa_za32_m(0, pg8, pg8, va, vb);
+  }
+  for (uint32_t r = 0; r < n32; r++) {
+    svst1_hor_za32(0, r, pg32, out + static_cast<size_t>(r) * n32);
+  }
+}
+
+struct CpuSmeVerifyResult {
+  bool ok = false;
+  double diff = 0.0;
+  int64_t diff_i32 = 0;
+};
+
+RunResult bench_cpu_sme_peak(Precision p, int n, int warmup, int repeats, std::string& note) {
+  const uint64_t inner = cpu_sme_peak_inner_from_n(n);
+  const int threads = cpu_sme_thread_count();
+  uint64_t ops_per_mopa = 0;
+  uint32_t lanes32 = 0;
+
+  RunResult r;
+  auto finish = [&](double best_seconds) {
+    r.best_seconds = best_seconds;
+    r.ops = ops_per_mopa * inner * static_cast<uint64_t>(threads);
+    r.tflops = static_cast<double>(r.ops) / best_seconds / 1e12;
+    r.threads = threads;
+    note = "sme_mopa peak_probe";
+    note += " | inner=" + std::to_string(inner);
+    note += " | threads=" + std::to_string(threads);
+    note += " | svl=" + std::to_string(static_cast<unsigned>(lanes32 * sizeof(float))) + "B";
+    if (p == Precision::INT8) note += " | int32 accumulate";
+    else note += " | fp32 accumulate";
+  };
+
+  if (p == Precision::FP32) {
+    float* a = aligned_alloc_64<float>(kSmePeakScratchElems);
+    float* b = aligned_alloc_64<float>(kSmePeakScratchElems);
+    std::vector<float*> outs(static_cast<size_t>(threads));
+    for (size_t i = 0; i < kSmePeakScratchElems; i++) {
+      a[i] = 1.0f;
+      b[i] = 1.0f;
+    }
+    for (float*& out : outs) out = aligned_alloc_64<float>(kSmePeakTileElems);
+    auto run_parallel = [&]() {
+      std::vector<std::thread> workers;
+      std::vector<uint64_t> ops(static_cast<size_t>(threads), 0);
+      std::vector<uint32_t> lanes(static_cast<size_t>(threads), 0);
+      workers.reserve(static_cast<size_t>(threads));
+      for (int t = 0; t < threads; t++) {
+        workers.emplace_back([&, t]() {
+          set_cpu_sme_worker_qos();
+          cpu_sme_peak_fp32_kernel(a, b, outs[t], inner, &ops[t], &lanes[t]);
+        });
+      }
+      for (auto& worker : workers) worker.join();
+      ops_per_mopa = ops[0];
+      lanes32 = lanes[0];
+    };
+    for (int i = 0; i < warmup; i++) run_parallel();
+    double best = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < repeats; i++) {
+      const auto t0 = std::chrono::high_resolution_clock::now();
+      run_parallel();
+      const auto t1 = std::chrono::high_resolution_clock::now();
+      best = std::min(best, seconds_since(t0, t1));
+    }
+    volatile float sink = outs[0][0];
+    (void)sink;
+    std::free(a);
+    std::free(b);
+    for (float* out : outs) std::free(out);
+    finish(best);
+    return r;
+  }
+
+  if (p == Precision::FP16) {
+    __fp16* a = aligned_alloc_64<__fp16>(kSmePeakScratchElems);
+    __fp16* b = aligned_alloc_64<__fp16>(kSmePeakScratchElems);
+    std::vector<float*> outs(static_cast<size_t>(threads));
+    for (size_t i = 0; i < kSmePeakScratchElems; i++) {
+      a[i] = static_cast<__fp16>(1.0f);
+      b[i] = static_cast<__fp16>(1.0f);
+    }
+    for (float*& out : outs) out = aligned_alloc_64<float>(kSmePeakTileElems);
+    auto run_parallel = [&]() {
+      std::vector<std::thread> workers;
+      std::vector<uint64_t> ops(static_cast<size_t>(threads), 0);
+      std::vector<uint32_t> lanes(static_cast<size_t>(threads), 0);
+      workers.reserve(static_cast<size_t>(threads));
+      for (int t = 0; t < threads; t++) {
+        workers.emplace_back([&, t]() {
+          set_cpu_sme_worker_qos();
+          cpu_sme_peak_fp16_kernel(a, b, outs[t], inner, &ops[t], &lanes[t]);
+        });
+      }
+      for (auto& worker : workers) worker.join();
+      ops_per_mopa = ops[0];
+      lanes32 = lanes[0];
+    };
+    for (int i = 0; i < warmup; i++) run_parallel();
+    double best = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < repeats; i++) {
+      const auto t0 = std::chrono::high_resolution_clock::now();
+      run_parallel();
+      const auto t1 = std::chrono::high_resolution_clock::now();
+      best = std::min(best, seconds_since(t0, t1));
+    }
+    volatile float sink = outs[0][0];
+    (void)sink;
+    std::free(a);
+    std::free(b);
+    for (float* out : outs) std::free(out);
+    finish(best);
+    return r;
+  }
+
+  if (p == Precision::BF16) {
+    bfloat16_t* a = aligned_alloc_64<bfloat16_t>(kSmePeakScratchElems);
+    bfloat16_t* b = aligned_alloc_64<bfloat16_t>(kSmePeakScratchElems);
+    std::vector<float*> outs(static_cast<size_t>(threads));
+    const uint16_t one_bits = fp32_to_bf16_peak_bits(1.0f);
+    for (size_t i = 0; i < kSmePeakScratchElems; i++) {
+      std::memcpy(&a[i], &one_bits, sizeof(one_bits));
+      std::memcpy(&b[i], &one_bits, sizeof(one_bits));
+    }
+    for (float*& out : outs) out = aligned_alloc_64<float>(kSmePeakTileElems);
+    auto run_parallel = [&]() {
+      std::vector<std::thread> workers;
+      std::vector<uint64_t> ops(static_cast<size_t>(threads), 0);
+      std::vector<uint32_t> lanes(static_cast<size_t>(threads), 0);
+      workers.reserve(static_cast<size_t>(threads));
+      for (int t = 0; t < threads; t++) {
+        workers.emplace_back([&, t]() {
+          set_cpu_sme_worker_qos();
+          cpu_sme_peak_bf16_kernel(a, b, outs[t], inner, &ops[t], &lanes[t]);
+        });
+      }
+      for (auto& worker : workers) worker.join();
+      ops_per_mopa = ops[0];
+      lanes32 = lanes[0];
+    };
+    for (int i = 0; i < warmup; i++) run_parallel();
+    double best = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < repeats; i++) {
+      const auto t0 = std::chrono::high_resolution_clock::now();
+      run_parallel();
+      const auto t1 = std::chrono::high_resolution_clock::now();
+      best = std::min(best, seconds_since(t0, t1));
+    }
+    volatile float sink = outs[0][0];
+    (void)sink;
+    std::free(a);
+    std::free(b);
+    for (float* out : outs) std::free(out);
+    finish(best);
+    return r;
+  }
+
+  int8_t* a = aligned_alloc_64<int8_t>(kSmePeakScratchElems);
+  int8_t* b = aligned_alloc_64<int8_t>(kSmePeakScratchElems);
+  std::vector<int32_t*> outs(static_cast<size_t>(threads));
+  for (size_t i = 0; i < kSmePeakScratchElems; i++) {
+    a[i] = 1;
+    b[i] = 1;
+  }
+  for (int32_t*& out : outs) out = aligned_alloc_64<int32_t>(kSmePeakTileElems);
+  auto run_parallel = [&]() {
+    std::vector<std::thread> workers;
+    std::vector<uint64_t> ops(static_cast<size_t>(threads), 0);
+    std::vector<uint32_t> lanes(static_cast<size_t>(threads), 0);
+    workers.reserve(static_cast<size_t>(threads));
+    for (int t = 0; t < threads; t++) {
+      workers.emplace_back([&, t]() {
+        set_cpu_sme_worker_qos();
+        cpu_sme_peak_int8_kernel(a, b, outs[t], inner, &ops[t], &lanes[t]);
+      });
+    }
+    for (auto& worker : workers) worker.join();
+    ops_per_mopa = ops[0];
+    lanes32 = lanes[0];
+  };
+  for (int i = 0; i < warmup; i++) run_parallel();
+  double best = std::numeric_limits<double>::infinity();
+  for (int i = 0; i < repeats; i++) {
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    run_parallel();
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    best = std::min(best, seconds_since(t0, t1));
+  }
+  volatile int32_t sink = outs[0][0];
+  (void)sink;
+  std::free(a);
+  std::free(b);
+  for (int32_t* out : outs) std::free(out);
+  finish(best);
+  return r;
+}
+
+CpuSmeVerifyResult verify_cpu_sme_peak(Precision p) {
+  constexpr uint64_t inner = 8;
+  uint64_t ops_per_mopa = 0;
+  uint32_t lanes32 = 0;
+  CpuSmeVerifyResult v;
+
+  if (p == Precision::FP32) {
+    float* a = aligned_alloc_64<float>(kSmePeakScratchElems);
+    float* b = aligned_alloc_64<float>(kSmePeakScratchElems);
+    float* out = aligned_alloc_64<float>(kSmePeakTileElems);
+    for (size_t i = 0; i < kSmePeakScratchElems; i++) a[i] = b[i] = 1.0f;
+    std::memset(out, 0, kSmePeakTileElems * sizeof(float));
+    cpu_sme_peak_fp32_kernel(a, b, out, inner, &ops_per_mopa, &lanes32);
+    const double expected = static_cast<double>(inner);
+    v.diff = std::fabs(static_cast<double>(out[0]) - expected);
+    v.ok = v.diff <= 1e-5;
+    std::free(a);
+    std::free(b);
+    std::free(out);
+    return v;
+  }
+
+  if (p == Precision::FP16) {
+    __fp16* a = aligned_alloc_64<__fp16>(kSmePeakScratchElems);
+    __fp16* b = aligned_alloc_64<__fp16>(kSmePeakScratchElems);
+    float* out = aligned_alloc_64<float>(kSmePeakTileElems);
+    for (size_t i = 0; i < kSmePeakScratchElems; i++) {
+      a[i] = static_cast<__fp16>(1.0f);
+      b[i] = static_cast<__fp16>(1.0f);
+    }
+    std::memset(out, 0, kSmePeakTileElems * sizeof(float));
+    cpu_sme_peak_fp16_kernel(a, b, out, inner, &ops_per_mopa, &lanes32);
+    const double expected = static_cast<double>(inner * 2);
+    v.diff = std::fabs(static_cast<double>(out[0]) - expected);
+    v.ok = v.diff <= 1e-5;
+    std::free(a);
+    std::free(b);
+    std::free(out);
+    return v;
+  }
+
+  if (p == Precision::BF16) {
+    bfloat16_t* a = aligned_alloc_64<bfloat16_t>(kSmePeakScratchElems);
+    bfloat16_t* b = aligned_alloc_64<bfloat16_t>(kSmePeakScratchElems);
+    float* out = aligned_alloc_64<float>(kSmePeakTileElems);
+    const uint16_t one_bits = fp32_to_bf16_peak_bits(1.0f);
+    for (size_t i = 0; i < kSmePeakScratchElems; i++) {
+      std::memcpy(&a[i], &one_bits, sizeof(one_bits));
+      std::memcpy(&b[i], &one_bits, sizeof(one_bits));
+    }
+    std::memset(out, 0, kSmePeakTileElems * sizeof(float));
+    cpu_sme_peak_bf16_kernel(a, b, out, inner, &ops_per_mopa, &lanes32);
+    const double expected = static_cast<double>(inner * 2);
+    v.diff = std::fabs(static_cast<double>(out[0]) - expected);
+    v.ok = v.diff <= 1e-5;
+    std::free(a);
+    std::free(b);
+    std::free(out);
+    return v;
+  }
+
+  int8_t* a = aligned_alloc_64<int8_t>(kSmePeakScratchElems);
+  int8_t* b = aligned_alloc_64<int8_t>(kSmePeakScratchElems);
+  int32_t* out = aligned_alloc_64<int32_t>(kSmePeakTileElems);
+  for (size_t i = 0; i < kSmePeakScratchElems; i++) a[i] = b[i] = 1;
+  std::memset(out, 0, kSmePeakTileElems * sizeof(int32_t));
+  cpu_sme_peak_int8_kernel(a, b, out, inner, &ops_per_mopa, &lanes32);
+  const int64_t expected = static_cast<int64_t>(inner * 4);
+  v.diff_i32 = std::llabs(static_cast<int64_t>(out[0]) - expected);
+  v.ok = v.diff_i32 == 0;
+  std::free(a);
+  std::free(b);
+  std::free(out);
+  return v;
+}
 
 template <typename Fn>
 RunResult bench_gemm(Fn&& fn, const float* a, const float* b, float* c, int n, int warmup,
@@ -802,7 +1188,7 @@ int64_t max_abs_diff_i32(const int32_t* x, const int32_t* y, int n) {
   return m;
 }
 
-void print_env_hint() {
+[[maybe_unused]] void print_env_hint() {
   // 不强制修改线程策略，但提示可复现性相关变量。
   const char* v1 = std::getenv("VECLIB_MAXIMUM_THREADS");
   const char* v2 = std::getenv("VECLIB_NUM_THREADS");
@@ -1194,7 +1580,7 @@ std::optional<SweetSpot> compute_sweet_spot(const std::vector<BenchRow>& rows, c
   return s;
 }
 
-bool verify_cpu_precision(Precision p, int n, double& diff, int64_t& diff_i32) {
+[[maybe_unused]] bool verify_cpu_precision(Precision p, int n, double& diff, int64_t& diff_i32) {
   const size_t nn = static_cast<size_t>(n) * static_cast<size_t>(n);
   diff = 0.0;
   diff_i32 = 0;
@@ -1293,10 +1679,12 @@ int main(int argc, char** argv) {
   const Options opt = parse_args(argc, argv);
 
   print_logo();
-  if (opt.unit == Options::Unit::GPU && opt.gpu_workload == Options::GpuWorkload::Peak) {
+  if (opt.unit == Options::Unit::CPU) {
+    std::cout << "CPU SME peak score: FP/BF16 use SME MOPA FLOPs; INT8 uses SME MOPA TOPS.\n\n";
+  } else if (opt.unit == Options::Unit::GPU && opt.gpu_workload == Options::GpuWorkload::Peak) {
     std::cout << "Peak score: FP/BF16 use matrix-unit FLOPs; INT8 uses a scalar TOPS probe.\n\n";
   } else if (opt.unit == Options::Unit::NPU) {
-    std::cout << "NPU score: private ANE conv1x1-chain operations (FP/BF16/FP32 => TFLOPS, INT8 => TOPS)\n\n";
+    std::cout << "NPU score: private ANE conv1x1-chain operations (FP16 => TFLOPS, INT8 => TOPS; FP32 disabled)\n\n";
   } else {
     std::cout << "GEMM score: 2*N^3 operations (FP/BF16 => TFLOPS, INT8 => TOPS)\n\n";
   }
@@ -1478,109 +1866,16 @@ int main(int argc, char** argv) {
     return true;
   };
 
-  auto run_one_cpu = [&](int size, Precision precision, Options::Mode mode, BenchRow& row) -> void {
-    const size_t nn = static_cast<size_t>(size) * static_cast<size_t>(size);
+  auto run_one_cpu = [&](int size, Precision precision, Options::Mode /*mode*/, BenchRow& row) -> void {
     auto add_note = [&](std::string_view s) {
       if (!row.note.empty()) row.note += " | ";
       row.note += std::string(s);
     };
 
-    int repeats = opt.repeats;
-    if ((mode == Options::Mode::Ref || precision != Precision::FP32) && size >= 1536 &&
-        opt.repeats > 1 && !opt.sweep) {
-      repeats = 1;
-    }
-
-    RunResult r;
-    if (precision == Precision::FP32) {
-      float* a = aligned_alloc_64<float>(nn);
-      float* b = aligned_alloc_64<float>(nn);
-      float* c = aligned_alloc_64<float>(nn);
-      fill_matrix(a, size, 1);
-      fill_matrix(b, size, 2);
-      if (mode == Options::Mode::AMX) {
-        r = bench_gemm(gemm_amx_accelerate, a, b, c, size, opt.warmup, repeats);
-        row.unit = "AMX (cblas)";
-      } else {
-        r = bench_gemm(gemm_ref_blocked, a, b, c, size, opt.warmup, repeats);
-        row.unit = "CPU ref";
-      }
-      std::free(a);
-      std::free(b);
-      std::free(c);
-    } else if (precision == Precision::FP16) {
-      __fp16* a = aligned_alloc_64<__fp16>(nn);
-      __fp16* b = aligned_alloc_64<__fp16>(nn);
-      __fp16* bt = aligned_alloc_64<__fp16>(nn);
-      float* c = aligned_alloc_64<float>(nn);
-      fill_matrix_fp16(a, size, 1);
-      fill_matrix_fp16(b, size, 2);
-      transpose_square(b, bt, size);
-      const bool fast = cpu_has_fp16();
-      if (fast) {
-        r = bench_callable([&]() { gemm_fp16_neon_pretransposed(a, bt, c, size); }, size, opt.warmup,
-                           repeats);
-      } else {
-        r = bench_callable([&]() { gemm_fp16_blocked(a, b, c, size); }, size, opt.warmup, repeats);
-      }
-      row.unit = fast ? "CPU NEON" : "CPU kernel";
-      add_note("fp32 accumulate");
-      if (!fast) add_note("fallback=blocked");
-      std::free(a);
-      std::free(b);
-      std::free(bt);
-      std::free(c);
-    } else if (precision == Precision::BF16) {
-      uint16_t* a = aligned_alloc_64<uint16_t>(nn);
-      uint16_t* b = aligned_alloc_64<uint16_t>(nn);
-      float* c = aligned_alloc_64<float>(nn);
-      fill_matrix_bf16(a, size, 1);
-      fill_matrix_bf16(b, size, 2);
-      const bool fast = cpu_use_bf16_neon();
-      r = bench_callable([&]() { gemm_bf16_blocked(a, b, c, size); }, size, opt.warmup, repeats);
-      row.unit = fast ? "CPU NEON" : "CPU kernel";
-      add_note("fp32 accumulate");
-      if (!fast) add_note("fallback=blocked");
-      std::free(a);
-      std::free(b);
-      std::free(c);
-    } else {
-      if (cpu_has_i8mm()) {
-        std::vector<int8_t> bpack(i8mm_bpack_size(size));
-        int8_t* a = aligned_alloc_64<int8_t>(nn);
-        int8_t* b = aligned_alloc_64<int8_t>(nn);
-        int32_t* c = aligned_alloc_64<int32_t>(nn);
-        fill_matrix_int8(a, size, 1);
-        fill_matrix_int8(b, size, 2);
-        if (!bpack.empty()) pack_b_int8_i8mm_4col(b, bpack.data(), size);
-        int used_threads = 1;
-        r = bench_callable([&]() {
-          used_threads = gemm_int8_i8mm_tiled_prepacked_threaded(a, b, bpack.data(), c, size);
-        }, size, opt.warmup, repeats);
-        r.threads = used_threads;
-        row.unit = "CPU I8MM GEMM";
-        add_note("smmla tiled 4x4");
-        add_note("int32 accumulate");
-        add_note("threads=" + std::to_string(r.threads));
-        add_note("B prepacked");
-        std::free(a);
-        std::free(b);
-        std::free(c);
-      } else {
-        int8_t* a = aligned_alloc_64<int8_t>(nn);
-        int8_t* b = aligned_alloc_64<int8_t>(nn);
-        int32_t* c = aligned_alloc_64<int32_t>(nn);
-        fill_matrix_int8(a, size, 1);
-        fill_matrix_int8(b, size, 2);
-        r = bench_callable([&]() { gemm_int8_blocked(a, b, c, size); }, size, opt.warmup, repeats);
-        row.unit = "CPU kernel";
-        add_note("int32 accumulate");
-        add_note("fallback=blocked (no I8MM)");
-        std::free(a);
-        std::free(b);
-        std::free(c);
-      }
-    }
+    std::string sme_note;
+    RunResult r = bench_cpu_sme_peak(precision, size, opt.warmup, opt.repeats, sme_note);
+    row.unit = "CPU SME";
+    add_note(sme_note);
 
     row.n = size;
     row.precision = precision;
@@ -1637,8 +1932,6 @@ int main(int argc, char** argv) {
         }
       } else {
         std::cout << std::flush;
-        const bool run_amx = (opt.mode == Options::Mode::AMX || opt.mode == Options::Mode::Both);
-        const bool run_ref = (opt.mode == Options::Mode::Ref || opt.mode == Options::Mode::Both);
 
         for (Precision p : opt.precisions) {
           BenchRow base;
@@ -1646,35 +1939,19 @@ int main(int argc, char** argv) {
           base.watts = watts;
           base.note = note;
           if (opt.verify) {
-            const int vn = std::min(size, 128);
-            double diff = 0.0;
-            int64_t diff_i32 = 0;
-            if (!verify_cpu_precision(p, vn, diff, diff_i32)) {
+            const CpuSmeVerifyResult verify = verify_cpu_sme_peak(p);
+            if (!verify.ok) {
               if (!base.note.empty()) base.note += " | ";
-              base.note += (p == Precision::INT8) ? ("verify max_abs_diff_i32=" + std::to_string(diff_i32))
-                                                  : "verify max_abs_diff too high";
+              base.note += (p == Precision::INT8)
+                               ? ("verify_sme diff_i32=" + std::to_string(verify.diff_i32))
+                               : ("verify_sme diff=" + std::to_string(verify.diff));
             }
           }
 
-          if (p == Precision::FP32) {
-            if (run_amx) {
-              BenchRow r1 = base;
-              run_one_cpu(size, p, Options::Mode::AMX, r1);
-              print_row(r1, show_watts);
-              printed.push_back(r1);
-            }
-            if (run_ref) {
-              BenchRow r2 = base;
-              run_one_cpu(size, p, Options::Mode::Ref, r2);
-              print_row(r2, show_watts);
-              printed.push_back(r2);
-            }
-          } else {
-            BenchRow r = base;
-            run_one_cpu(size, p, Options::Mode::AMX, r);
-            print_row(r, show_watts);
-            printed.push_back(r);
-          }
+          BenchRow r = base;
+          run_one_cpu(size, p, Options::Mode::AMX, r);
+          print_row(r, show_watts);
+          printed.push_back(r);
         }
         continue;
       }
@@ -1692,21 +1969,7 @@ int main(int argc, char** argv) {
       }
     } else {
       for (Precision p : opt.precisions) {
-        if (p == Precision::FP32) {
-          if (opt.mode == Options::Mode::AMX || opt.mode == Options::Mode::Both) {
-            keys.push_back({"AMX (cblas)", p});
-          }
-          if (opt.mode == Options::Mode::Ref || opt.mode == Options::Mode::Both) {
-            keys.push_back({"CPU ref", p});
-          }
-        } else {
-          if (p == Precision::INT8) {
-            keys.push_back({cpu_has_i8mm() ? "CPU I8MM GEMM" : "CPU kernel", p});
-          } else {
-            const bool fast = (p == Precision::FP16) ? cpu_has_fp16() : cpu_use_bf16_neon();
-            keys.push_back({fast ? "CPU NEON" : "CPU kernel", p});
-          }
-        }
+        keys.push_back({"CPU SME", p});
       }
     }
 
@@ -1923,48 +2186,29 @@ int main(int argc, char** argv) {
     return any_fail ? 2 : 0;
   }
 
-  std::cout << "CPU (FP32 Accelerate cblas + FP16 NEON + BF16 typed + INT8 I8MM GEMM)\n";
-  print_env_hint();
+  std::cout << "CPU (SME MOPA peak probe: FP32/FP16/BF16/INT8)\n";
+  std::cout << "hint: CPU --n controls SME inner loop scale; MTFLOPS_CPU_THREADS overrides worker count.\n";
   std::cout << "\n";
 
-  const bool run_amx = (opt.mode == Options::Mode::AMX || opt.mode == Options::Mode::Both);
-  const bool run_ref = (opt.mode == Options::Mode::Ref || opt.mode == Options::Mode::Both);
-
   if (opt.verify) {
-    const int vn = std::min(n, 128);
     for (Precision p : opt.precisions) {
-      double diff = 0.0;
-      int64_t diff_i32 = 0;
-      const bool ok = verify_cpu_precision(p, vn, diff, diff_i32);
-      std::cout << "verify(cpu): prec=" << precision_to_string(p) << " N=" << vn;
+      const CpuSmeVerifyResult verify = verify_cpu_sme_peak(p);
+      std::cout << "verify(cpu_sme_peak): prec=" << precision_to_string(p);
       if (p == Precision::INT8) {
-        std::cout << " max_abs_diff_i32=" << diff_i32;
+        std::cout << " diff_i32=" << verify.diff_i32;
       } else {
-        std::cout << " max_abs_diff=" << std::scientific << diff;
+        std::cout << " diff=" << std::scientific << verify.diff;
       }
-      std::cout << (ok ? "\n" : " FAILED\n");
+      std::cout << (verify.ok ? "\n" : " FAILED\n");
     }
     std::cout << "\n";
   }
 
   print_table_header(false);
   for (Precision p : opt.precisions) {
-    if (p == Precision::FP32) {
-      if (run_amx) {
-        BenchRow row;
-        run_one_cpu(n, p, Options::Mode::AMX, row);
-        print_row(row, false);
-      }
-      if (run_ref) {
-        BenchRow row;
-        run_one_cpu(n, p, Options::Mode::Ref, row);
-        print_row(row, false);
-      }
-    } else {
-      BenchRow row;
-      run_one_cpu(n, p, Options::Mode::AMX, row);
-      print_row(row, false);
-    }
+    BenchRow row;
+    run_one_cpu(n, p, Options::Mode::AMX, row);
+    print_row(row, false);
   }
 
   return 0;

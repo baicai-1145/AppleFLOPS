@@ -20,7 +20,7 @@ struct NpuBenchOptions {
 
 struct NpuBenchResult {
   double best_seconds = 0.0;
-  double score = 0.0;  // FP/BF16/FP32: TFLOPS, INT8: TOPS
+  double score = 0.0;  // FP/BF16 probes and FP16 score: TFLOPS, INT8: TOPS
   double operations = 0.0;
   bool npu_only = false;
   std::string backend;
