@@ -2,6 +2,7 @@
 
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -46,8 +47,28 @@ struct BenchRow {
   std::string note;
 };
 
+struct PowerRailStats {
+  std::optional<double> median;
+  std::optional<double> avg;
+  std::optional<double> min;
+  std::optional<double> max;
+  int samples = 0;
+};
+
+struct PowerRailSeries {
+  PowerRailStats cpu;
+  PowerRailStats gpu;
+  PowerRailStats ane;
+};
+
+struct PoweredBenchRow {
+  BenchRow row;
+  std::optional<PowerRailSeries> rails;
+  std::string power_note;
+};
+
 struct Options {
-  enum class Unit { CPU, GPU, NPU };
+  enum class Unit { CPU, GPU, NPU, ALL };
   enum class Mode { AMX, Ref, Both };
   enum class Power { None, Powermetrics };
   enum class GpuKernel { Auto, V4 };
@@ -81,6 +102,8 @@ struct Options {
 
   Power power = Power::None;
   int power_every = 5;  // 仅在 --stress 中生效：每 N 次迭代采样一次功耗，避免 powermetrics 过度干扰。
+  int power_window_ms = 0;  // 0=默认 1000ms。
+  int power_samples = 3;
 };
 
 [[noreturn]] void die(std::string_view msg) {
@@ -161,12 +184,12 @@ Options parse_args(int argc, char** argv) {
       std::cout
           << "MTFLOPS (CPU SME + Metal GPU + private ANE)\n\n"
           << "Usage:\n"
-          << "  ./mtflops [--unit cpu|gpu|npu] [--mode amx|ref|both] [--precision fp16|fp32|bf16|int8|both|all]\n"
+          << "  ./mtflops [--unit cpu|gpu|npu|all] [--mode amx|ref|both] [--precision fp16|fp32|bf16|int8|both|all]\n"
           << "           [--n N] [--warmup W] [--repeats R] [--verify 0|1]\n"
           << "           [--shader <path>]\n\n"
           << "           [--sweep 0|1] [--sweep-min N] [--sweep-max N]\n"
           << "           [--stress ITERS]\n"
-          << "           [--power none|powermetrics] [--power-every K]\n"
+          << "           [--power none|powermetrics] [--power-every K] [--power-window-ms MS] [--power-samples N]\n"
           << "           [--kernel auto|v4]\n\n"
           << "           [--gpu-storage shared|private] [--gpu-batch B]\n\n"
           << "           [--gpu-inner I]  (I>1 为 compute-amplified，趋近理论峰值用)\n\n"
@@ -175,14 +198,18 @@ Options parse_args(int argc, char** argv) {
           << "Notes:\n"
           << "  - CPU 口径：SME MOPA peak probe；N 控制 inner loop 规模，不再走 Accelerate/NEON/I8MM GEMM。\n"
           << "  - GPU GEMM 口径：浮点按 2*N^3 计 TFLOPS；INT8 按 2*N^3 计 TOPS。\n"
-          << "  - NPU 使用 private ANE conv1x1-chain：只报告 FP16/INT8；N=channels，--npu-spatial/--npu-depth 控制工作量。\n";
+          << "  - NPU 使用 private ANE conv1x1-chain：只报告 FP16/INT8；N=channels，--npu-spatial/--npu-depth 控制工作量。\n"
+          << "  - sudo --power powermetrics 会采样 cpu/gpu/ane 三条 rail。\n"
+          << "  - --power-window-ms 控制 powermetrics 单样本窗口；--power-samples 控制样本数。\n"
+          << "  - 启用 power 时 workload 会在完整采样期间持续循环，Watts 列使用对应 rail 的 median。\n";
       std::exit(0);
     } else if (a == "--unit") {
       auto v = need_value("--unit");
       if (v == "cpu") opt.unit = Options::Unit::CPU;
       else if (v == "gpu") opt.unit = Options::Unit::GPU;
       else if (v == "npu" || v == "ane") opt.unit = Options::Unit::NPU;
-      else die("--unit must be one of: cpu, gpu, npu");
+      else if (v == "all") opt.unit = Options::Unit::ALL;
+      else die("--unit must be one of: cpu, gpu, npu, all");
     } else if (a == "--mode") {
       auto v = need_value("--mode");
       if (v == "amx") opt.mode = Options::Mode::AMX;
@@ -252,6 +279,18 @@ Options parse_args(int argc, char** argv) {
       int v = 0;
       if (!parse_int(need_value("--power-every"), v) || v <= 0) die("--power-every must be > 0");
       opt.power_every = v;
+    } else if (a == "--power-window-ms") {
+      int v = 0;
+      if (!parse_int(need_value("--power-window-ms"), v) || v < 100) {
+        die("--power-window-ms must be >= 100");
+      }
+      opt.power_window_ms = v;
+    } else if (a == "--power-samples") {
+      int v = 0;
+      if (!parse_int(need_value("--power-samples"), v) || v <= 0) {
+        die("--power-samples must be > 0");
+      }
+      opt.power_samples = v;
     } else if (a == "--n") {
       int v = 0;
       if (!parse_int(need_value("--n"), v) || v <= 0) die("--n must be a positive integer");
@@ -276,6 +315,9 @@ Options parse_args(int argc, char** argv) {
   if (!opt.precision_set) {
     if (opt.unit == Options::Unit::GPU) opt.precisions = {Precision::FP16};
     else if (opt.unit == Options::Unit::NPU) opt.precisions = {Precision::FP16, Precision::INT8};
+    else if (opt.unit == Options::Unit::ALL) {
+      opt.precisions = {Precision::FP16, Precision::FP32, Precision::BF16, Precision::INT8};
+    }
     else opt.precisions = {Precision::FP32};
   } else if (opt.unit == Options::Unit::NPU) {
     if (opt.precision_arg == "all" || opt.precision_arg == "both") {
@@ -289,6 +331,9 @@ Options parse_args(int argc, char** argv) {
     }
   }
   if (opt.unit == Options::Unit::NPU && !opt.n_set) opt.n = 512;
+  if (opt.unit == Options::Unit::ALL) {
+    if (opt.sweep) die("--unit all does not support --sweep; run sweep per unit");
+  }
   return opt;
 }
 
@@ -762,15 +807,41 @@ constexpr size_t kSmePeakScratchElems = 4096;
 constexpr size_t kSmePeakTileElems = 65536;
 constexpr uint64_t kSmePeakIterScale = 16384;
 constexpr uint64_t kSmePeakMaxInner = 1ull << 28;
+std::atomic<int> g_cpu_sme_thread_override{0};
+
+int cpu_sme_hardware_thread_count() {
+  const unsigned hc = std::thread::hardware_concurrency();
+  return static_cast<int>(std::max(1u, hc));
+}
 
 int cpu_sme_thread_count() {
   if (const char* env = std::getenv("MTFLOPS_CPU_THREADS")) {
     int v = 0;
     if (parse_int(env, v) && v > 0) return v;
   }
-  const unsigned hc = std::thread::hardware_concurrency();
-  return static_cast<int>(std::max(1u, hc) * 6u);
+  const int override_threads = g_cpu_sme_thread_override.load(std::memory_order_relaxed);
+  if (override_threads > 0) return override_threads;
+  return cpu_sme_hardware_thread_count() * 6;
 }
+
+bool cpu_sme_threads_env_set() {
+  return std::getenv("MTFLOPS_CPU_THREADS") != nullptr;
+}
+
+struct ScopedCpuSmeThreadOverride {
+  explicit ScopedCpuSmeThreadOverride(int threads)
+      : active(threads > 0),
+        previous(g_cpu_sme_thread_override.load(std::memory_order_relaxed)) {
+    if (active) g_cpu_sme_thread_override.store(threads, std::memory_order_relaxed);
+  }
+
+  ~ScopedCpuSmeThreadOverride() {
+    if (active) g_cpu_sme_thread_override.store(previous, std::memory_order_relaxed);
+  }
+
+  bool active = false;
+  int previous = 0;
+};
 
 void set_cpu_sme_worker_qos() {
 #if defined(__APPLE__)
@@ -1226,27 +1297,9 @@ std::string metric_to_string(Precision p) {
   return (p == Precision::INT8) ? "TOPS" : "TFLOPS";
 }
 
-const char* power_key_for_unit(Options::Unit unit) {
-  switch (unit) {
-    case Options::Unit::CPU: return "cpu_power";
-    case Options::Unit::GPU: return "gpu_power";
-    case Options::Unit::NPU: return "ane_power";
-  }
-  return "cpu_power";
-}
-
-const char* power_unit_name(Options::Unit unit) {
-  switch (unit) {
-    case Options::Unit::CPU: return "cpu";
-    case Options::Unit::GPU: return "gpu";
-    case Options::Unit::NPU: return "ane";
-  }
-  return "cpu";
-}
-
-std::optional<double> parse_plist_power_watts(const std::string& text, const char* key) {
+std::vector<double> parse_plist_power_watts_all(const std::string& text, const char* key) {
+  std::vector<double> values;
   const std::string marker = std::string("<key>") + key + "</key>";
-  std::optional<double> last;
   size_t pos = 0;
   while ((pos = text.find(marker, pos)) != std::string::npos) {
     const size_t value_start = pos + marker.size();
@@ -1283,20 +1336,65 @@ std::optional<double> parse_plist_power_watts(const std::string& text, const cha
     char* endp = nullptr;
     const double mw = std::strtod(number.c_str(), &endp);
     if (endp != number.c_str() && std::isfinite(mw) && mw >= 0.0 && mw < 200000.0) {
-      last = mw / 1000.0;
+      values.push_back(mw / 1000.0);
     }
     pos = number_end + std::strlen(close_tag);
   }
-  return last;
+  return values;
 }
 
-void append_power_rail_note(std::string& note, const std::string& sample) {
-  const auto cpu = parse_plist_power_watts(sample, "cpu_power");
-  const auto gpu = parse_plist_power_watts(sample, "gpu_power");
-  const auto ane = parse_plist_power_watts(sample, "ane_power");
-  char buf[160];
-  std::snprintf(buf, sizeof(buf), "cpu=%.3fW gpu=%.3fW ane=%.3fW",
-                cpu.value_or(0.0), gpu.value_or(0.0), ane.value_or(0.0));
+PowerRailStats summarize_power_values(std::vector<double> values) {
+  PowerRailStats stats;
+  if (values.empty()) return stats;
+  std::sort(values.begin(), values.end());
+  stats.samples = static_cast<int>(values.size());
+  stats.min = values.front();
+  stats.max = values.back();
+  double sum = 0.0;
+  for (double v : values) sum += v;
+  stats.avg = sum / static_cast<double>(values.size());
+  const size_t mid = values.size() / 2;
+  if (values.size() % 2 == 0) {
+    stats.median = (values[mid - 1] + values[mid]) * 0.5;
+  } else {
+    stats.median = values[mid];
+  }
+  return stats;
+}
+
+PowerRailSeries parse_power_rail_series(const std::string& sample) {
+  PowerRailSeries series;
+  series.cpu = summarize_power_values(parse_plist_power_watts_all(sample, "cpu_power"));
+  series.gpu = summarize_power_values(parse_plist_power_watts_all(sample, "gpu_power"));
+  series.ane = summarize_power_values(parse_plist_power_watts_all(sample, "ane_power"));
+  return series;
+}
+
+bool any_power_rail(const PowerRailSeries& series) {
+  return series.cpu.samples > 0 || series.gpu.samples > 0 || series.ane.samples > 0;
+}
+
+std::optional<double> power_median_for_unit(const PowerRailSeries& series, Options::Unit unit) {
+  switch (unit) {
+    case Options::Unit::CPU: return series.cpu.median;
+    case Options::Unit::GPU: return series.gpu.median;
+    case Options::Unit::NPU: return series.ane.median;
+    case Options::Unit::ALL: return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+void append_power_rail_note(std::string& note, const PowerRailSeries& series) {
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "median(cpu/gpu/ane)=%.3f/%.3f/%.3fW | avg(cpu/gpu/ane)=%.3f/%.3f/%.3fW | range(cpu/gpu/ane)=%.3f-%.3f/%.3f-%.3f/%.3f-%.3fW | samples=%d/%d/%d",
+                series.cpu.median.value_or(0.0), series.gpu.median.value_or(0.0),
+                series.ane.median.value_or(0.0), series.cpu.avg.value_or(0.0),
+                series.gpu.avg.value_or(0.0), series.ane.avg.value_or(0.0),
+                series.cpu.min.value_or(0.0), series.cpu.max.value_or(0.0),
+                series.gpu.min.value_or(0.0), series.gpu.max.value_or(0.0),
+                series.ane.min.value_or(0.0), series.ane.max.value_or(0.0),
+                series.cpu.samples, series.gpu.samples, series.ane.samples);
   note += " | ";
   note += buf;
 }
@@ -1309,94 +1407,31 @@ int run_command_capture(const std::string& cmd, std::string& out) {
   return pclose(fp);
 }
 
-std::optional<double> read_power_watts_powermetrics(Options::Unit unit, std::string& note) {
-  // powermetrics 通常需要 sudo。这里仅在用户显式启用 `--power powermetrics` 时尝试读取，
-  // 失败则返回空并给出 note（避免影响基准测试主流程）。
+std::pair<std::optional<PowerRailSeries>, std::string> read_power_rails_powermetrics(int interval_ms,
+                                                                                     int samples) {
+  std::string note;
   if (geteuid() != 0) {
     note = "powermetrics 需要 sudo（用 sudo 运行本程序后再启用 --power powermetrics）";
-    return std::nullopt;
+    return {std::nullopt, note};
   }
 
-  auto parse_text_watts = [](const std::string& text, const char* needle) -> std::optional<double> {
-    // 逐行：找包含目标 rail 名称且包含 W/mW 的行，提取第一个数值。
-    size_t start = 0;
-    while (start < text.size()) {
-      size_t end = text.find('\n', start);
-      if (end == std::string::npos) end = text.size();
-      std::string line = text.substr(start, end - start);
-      start = end + 1;
-
-      std::string lower = line;
-      for (char& ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-      if (lower.find(needle) == std::string::npos) continue;
-
-      const bool has_mw = (lower.find("mw") != std::string::npos);
-      const bool has_w = (lower.find('w') != std::string::npos);
-      if (!has_w) continue;
-
-      size_t i = 0;
-      while (i < line.size() && (line[i] < '0' || line[i] > '9') && line[i] != '.' && line[i] != '-') i++;
-      if (i >= line.size()) continue;
-      const double v = std::strtod(line.c_str() + i, nullptr);
-      if (!std::isfinite(v) || v <= 0.0) continue;
-
-      double watts = v;
-      if (has_mw) watts = v / 1000.0;
-      if (watts > 0.0 && watts < 200.0) return watts;
-    }
-    return std::nullopt;
-  };
-
-  const char* key = power_key_for_unit(unit);
-  const char* name = power_unit_name(unit);
-  const int interval_ms = (unit == Options::Unit::NPU) ? 1000 : 200;
-
-  // cpu_power 的 plist 在本机同时包含 cpu_power/gpu_power/ane_power，且单位为 mW。
-  // 这是 NPU/ANE rail 当前可解析的最小 sampler。
-  {
-    std::string out;
-    const std::string cmd =
-        "powermetrics --samplers cpu_power -f plist -n 1 -i " + std::to_string(interval_ms) + " 2>&1";
-    const int rc = run_command_capture(cmd, out);
-    if (rc == 0) {
-      if (auto w = parse_plist_power_watts(out, key)) {
-        note = "powermetrics(cpu_power plist key=" + std::string(key) + " interval=" +
-               std::to_string(interval_ms) + "ms)";
-        append_power_rail_note(note, out);
-        return w;
-      }
+  std::string out;
+  const std::string cmd =
+      "powermetrics --samplers cpu_power -f plist -n " + std::to_string(samples) + " -i " +
+      std::to_string(interval_ms) + " 2>&1";
+  const int rc = run_command_capture(cmd, out);
+  if (rc == 0) {
+    PowerRailSeries series = parse_power_rail_series(out);
+    if (any_power_rail(series)) {
+      note = "powermetrics(cpu_power plist rails interval=" + std::to_string(interval_ms) +
+             "ms samples=" + std::to_string(samples) + " median)";
+      append_power_rail_note(note, series);
+      return {series, note};
     }
   }
 
-  // GPU 仍保留文本 gpu_power 回退；ANE 的 ane_power 文本 sampler 在本机只输出采样头。
-  if (unit == Options::Unit::GPU) {
-    std::string out;
-    const std::string cmd =
-        "powermetrics --samplers gpu_power -n 1 -i " + std::to_string(interval_ms) + " 2>&1";
-    const int rc = run_command_capture(cmd, out);
-    if (rc == 0) {
-      if (auto w = parse_text_watts(out, name)) {
-        note = "powermetrics(gpu_power text)";
-        return w;
-      }
-    }
-  }
-
-  {
-    std::string out;
-    const std::string cmd =
-        "powermetrics --samplers smc -n 1 -i " + std::to_string(interval_ms) + " 2>&1";
-    const int rc = run_command_capture(cmd, out);
-    if (rc == 0) {
-      if (auto w = parse_text_watts(out, name)) {
-        note = "powermetrics(smc text)";
-        return w;
-      }
-    }
-  }
-
-  note = "powermetrics 未解析到 " + std::string(key) + " 功耗字段";
-  return std::nullopt;
+  note = "powermetrics 未解析到 cpu/gpu/ane 功耗字段";
+  return {std::nullopt, note};
 }
 
 std::optional<double> parse_process_gpu_ms_s(const std::string& text, const char* process_name) {
@@ -1481,9 +1516,13 @@ void print_row(const BenchRow& r, bool show_watts) {
             << std::setw(8) << r.n
             << std::setw(20) << r.unit
             << std::setw(8) << precision_to_string(r.precision)
-            << std::setw(10) << std::fixed << std::setprecision(3) << ms
-            << std::setw(10) << std::fixed << std::setprecision(3) << r.tflops
-            << std::setw(8) << metric_to_string(r.precision);
+            << std::setw(10) << std::fixed << std::setprecision(3) << ms;
+  if (r.precision == Precision::NA) {
+    std::cout << std::setw(10) << "-" << std::setw(8) << "-";
+  } else {
+    std::cout << std::setw(10) << std::fixed << std::setprecision(3) << r.tflops
+              << std::setw(8) << metric_to_string(r.precision);
+  }
 
   if (show_watts) {
     if (r.watts.has_value()) {
@@ -1685,6 +1724,12 @@ int main(int argc, char** argv) {
     std::cout << "Peak score: FP/BF16 use matrix-unit FLOPs; INT8 uses a scalar TOPS probe.\n\n";
   } else if (opt.unit == Options::Unit::NPU) {
     std::cout << "NPU score: private ANE conv1x1-chain operations (FP16 => TFLOPS, INT8 => TOPS; FP32 disabled)\n\n";
+  } else if (opt.unit == Options::Unit::ALL) {
+    if (opt.stress > 0) {
+      std::cout << "All-unit simultaneous stress: CPU + GPU + NPU workloads run concurrently.\n\n";
+    } else {
+      std::cout << "All-unit score: CPU FP32/FP16/BF16/INT8, GPU FP32/FP16/BF16, NPU FP16/INT8.\n\n";
+    }
   } else {
     std::cout << "GEMM score: 2*N^3 operations (FP/BF16 => TFLOPS, INT8 => TOPS)\n\n";
   }
@@ -1693,10 +1738,62 @@ int main(int argc, char** argv) {
   const int n = opt.n;
   std::array<bool, 4> gpu_verified = {false, false, false, false};
 
-  auto get_watts = [&](std::string& note) -> std::optional<double> {
-    if (opt.power == Options::Power::None) return std::nullopt;
-    if (opt.power == Options::Power::Powermetrics) return read_power_watts_powermetrics(opt.unit, note);
-    return std::nullopt;
+  const int power_window_ms = (opt.power_window_ms > 0) ? opt.power_window_ms : 1000;
+  const int power_samples = opt.power_samples;
+
+  auto sample_power_async = [power_window_ms, power_samples]() {
+    return std::async(std::launch::async, [power_window_ms, power_samples]() {
+      return read_power_rails_powermetrics(power_window_ms, power_samples);
+    });
+  };
+
+  auto attach_power_sample = [](BenchRow& row, Options::Unit unit,
+                                const std::optional<PowerRailSeries>& rails,
+                                const std::string& note) {
+    if (rails.has_value()) row.watts = power_median_for_unit(*rails, unit);
+    if (!note.empty()) {
+      if (!row.note.empty()) row.note += " | ";
+      row.note += note;
+    }
+  };
+
+  auto run_with_power_sample = [&](auto&& run_once, Options::Unit unit,
+                                   const char* label) -> PoweredBenchRow {
+    PoweredBenchRow out;
+    if (opt.power == Options::Power::None) {
+      out.row = run_once();
+      return out;
+    }
+
+    std::atomic<bool> stop{false};
+    auto bench_future = std::async(std::launch::async, [&]() {
+      BenchRow best;
+      int loops = 0;
+      bool have = false;
+      while (!stop.load(std::memory_order_relaxed) || loops == 0) {
+        BenchRow row = run_once();
+        loops++;
+        if (!have || row.tflops > best.tflops) {
+          best = row;
+          have = true;
+        }
+        if (row.tflops <= 0.0) break;
+      }
+      if (!best.note.empty()) best.note += " | ";
+      best.note += std::string(label) + "_loops=" + std::to_string(loops) +
+                   " | power_window=" + std::to_string(power_window_ms) +
+                   "ms | power_samples=" + std::to_string(power_samples);
+      return best;
+    });
+
+    auto power_future = sample_power_async();
+    auto sampled = power_future.get();
+    stop.store(true, std::memory_order_relaxed);
+    out.row = bench_future.get();
+    out.rails = sampled.first;
+    out.power_note = sampled.second;
+    attach_power_sample(out.row, unit, out.rails, out.power_note);
+    return out;
   };
 
   auto run_one_gpu = [&](int size, GpuPrecision precision, BenchRow& row, std::string& err) -> bool {
@@ -1783,8 +1880,10 @@ int main(int argc, char** argv) {
       const double thr = (precision == GpuPrecision::FP32) ? 1e-2
                          : (precision == GpuPrecision::INT8) ? 0.0
                                                             : 1e-1;
-      std::cout << "verify(gpu): prec=" << precision_to_string(row_precision)
-                << " N=" << vn << " max_abs_diff=" << std::scientific << diff << "\n\n";
+      if (opt.unit != Options::Unit::ALL) {
+        std::cout << "verify(gpu): prec=" << precision_to_string(row_precision)
+                  << " N=" << vn << " max_abs_diff=" << std::scientific << diff << "\n\n";
+      }
       if (diff > thr) {
         err = "GPU verify max_abs_diff too high";
         return false;
@@ -1883,6 +1982,10 @@ int main(int argc, char** argv) {
     row.tflops = r.tflops;
   };
 
+  auto selected = [&](Precision precision) -> bool {
+    return std::find(opt.precisions.begin(), opt.precisions.end(), precision) != opt.precisions.end();
+  };
+
   if (opt.sweep) {
     const auto sizes = make_sweep_sizes(opt.sweep_min, opt.sweep_max);
     const bool show_watts = (opt.power != Options::Power::None);
@@ -1893,19 +1996,24 @@ int main(int argc, char** argv) {
     printed.reserve(static_cast<size_t>(sizes.size()) * per_size);
 
     for (int size : sizes) {
-      std::string note;
-      const std::optional<double> watts = get_watts(note);
-
       if (opt.unit == Options::Unit::GPU) {
         bool stop = false;
         for (Precision p : opt.precisions) {
-          BenchRow row;
-          row.n = size;
-          row.watts = watts;
-          row.note = note;
-          std::string err;
-          if (!run_one_gpu(size, gpu_precision_from_precision(p), row, err)) {
-            row.note = err;
+          auto run_once = [&]() {
+            BenchRow row;
+            row.n = size;
+            std::string err;
+            if (!run_one_gpu(size, gpu_precision_from_precision(p), row, err)) {
+              row.n = size;
+              row.precision = p;
+              row.unit = (p == Precision::INT8) ? "GPU (MPS QMM)" : "GPU (simdgroup)";
+              row.note = err;
+            }
+            return row;
+          };
+          PoweredBenchRow powered = run_with_power_sample(run_once, Options::Unit::GPU, "gpu");
+          BenchRow row = powered.row;
+          if (row.tflops <= 0.0) {
             print_row(row, show_watts);
             printed.push_back(row);
             stop = true;
@@ -1917,16 +2025,18 @@ int main(int argc, char** argv) {
         if (stop) break;
       } else if (opt.unit == Options::Unit::NPU) {
         for (Precision p : opt.precisions) {
-          BenchRow row;
-          row.n = size;
-          row.watts = watts;
-          row.note = note;
-          std::string err;
-          if (!run_one_npu(size, p, row, err)) {
-            row.precision = p;
-            row.unit = "NPU (private ANE)";
-            row.note = err;
-          }
+          auto run_once = [&]() {
+            BenchRow row;
+            row.n = size;
+            std::string err;
+            if (!run_one_npu(size, p, row, err)) {
+              row.precision = p;
+              row.unit = "NPU (private ANE)";
+              row.note = err;
+            }
+            return row;
+          };
+          BenchRow row = run_with_power_sample(run_once, Options::Unit::NPU, "npu").row;
           print_row(row, show_watts);
           printed.push_back(row);
         }
@@ -1936,8 +2046,6 @@ int main(int argc, char** argv) {
         for (Precision p : opt.precisions) {
           BenchRow base;
           base.n = size;
-          base.watts = watts;
-          base.note = note;
           if (opt.verify) {
             const CpuSmeVerifyResult verify = verify_cpu_sme_peak(p);
             if (!verify.ok) {
@@ -1949,7 +2057,12 @@ int main(int argc, char** argv) {
           }
 
           BenchRow r = base;
-          run_one_cpu(size, p, Options::Mode::AMX, r);
+          auto run_once = [&]() {
+            BenchRow row = base;
+            run_one_cpu(size, p, Options::Mode::AMX, row);
+            return row;
+          };
+          r = run_with_power_sample(run_once, Options::Unit::CPU, "cpu").row;
           print_row(r, show_watts);
           printed.push_back(r);
         }
@@ -1994,36 +2107,188 @@ int main(int argc, char** argv) {
     const bool show_watts = (opt.power != Options::Power::None);
     print_table_header(show_watts);
 
-    std::optional<double> cached_watts;
+    std::optional<PowerRailSeries> cached_rails;
     std::string cached_power_note;
     std::string cached_process_gpu_note;
+
+    if (opt.unit == Options::Unit::ALL) {
+      constexpr int kDefaultNpuChannels = 512;
+      const int balanced_cpu_threads =
+          (show_watts && !cpu_sme_threads_env_set()) ? cpu_sme_hardware_thread_count() : 0;
+      ScopedCpuSmeThreadOverride cpu_thread_override(balanced_cpu_threads);
+      Precision cpu_precision = Precision::FP16;
+      Precision gpu_precision = Precision::FP16;
+      Precision npu_precision = Precision::FP16;
+      if (opt.precisions.size() == 1 && selected(Precision::INT8)) {
+        cpu_precision = Precision::INT8;
+        npu_precision = Precision::INT8;
+      } else if (opt.precisions.size() == 1 && selected(Precision::BF16)) {
+        cpu_precision = Precision::BF16;
+        gpu_precision = Precision::BF16;
+      } else if (opt.precisions.size() == 1 && selected(Precision::FP32)) {
+        cpu_precision = Precision::FP32;
+        gpu_precision = Precision::FP32;
+      }
+
+      for (int iter = 0; iter < opt.stress; iter++) {
+        std::optional<PowerRailSeries> rails;
+        std::string power_note;
+
+        auto run_cpu_once = [&]() {
+          BenchRow row;
+          row.note = "iter=" + std::to_string(iter) + " | simultaneous";
+          run_one_cpu(n, cpu_precision, Options::Mode::AMX, row);
+          if (balanced_cpu_threads > 0) {
+            row.note += " | power_balanced_cpu_threads=" + std::to_string(balanced_cpu_threads);
+          }
+          return row;
+        };
+
+        auto run_gpu_once = [&]() {
+          BenchRow row;
+          row.note = "iter=" + std::to_string(iter) + " | simultaneous";
+          std::string err;
+          if (!run_one_gpu(n, gpu_precision_from_precision(gpu_precision), row, err)) {
+            row.n = n;
+            row.unit = "GPU (simdgroup)";
+            row.precision = gpu_precision;
+            row.note = "iter=" + std::to_string(iter) + " | simultaneous | " + err;
+          }
+          return row;
+        };
+
+        auto run_npu_once = [&]() {
+          BenchRow row;
+          row.note = "iter=" + std::to_string(iter) + " | simultaneous";
+          std::string err;
+          if (!run_one_npu(kDefaultNpuChannels, npu_precision, row, err)) {
+            row.n = kDefaultNpuChannels;
+            row.unit = "NPU (private ANE)";
+            row.precision = npu_precision;
+            row.note = "iter=" + std::to_string(iter) + " | simultaneous | " + err;
+          }
+          return row;
+        };
+
+        BenchRow cpu_row;
+        BenchRow gpu_row;
+        BenchRow npu_row;
+
+        if (show_watts) {
+          std::atomic<bool> stop{false};
+
+          auto run_until_stop = [&](auto&& run_once, const char* label) {
+            BenchRow best;
+            int loops = 0;
+            bool have = false;
+            while (!stop.load(std::memory_order_relaxed) || loops == 0) {
+              BenchRow row = run_once();
+              loops++;
+              if (!have || row.tflops > best.tflops) {
+                best = row;
+                have = true;
+              }
+              if (row.tflops <= 0.0) break;
+            }
+            if (!best.note.empty()) best.note += " | ";
+            best.note += std::string(label) + "_loops=" + std::to_string(loops) +
+                         " | power_window=" + std::to_string(power_window_ms) +
+                         "ms | power_samples=" + std::to_string(power_samples);
+            return best;
+          };
+
+          auto cpu_future = std::async(std::launch::async, [&]() {
+            return run_until_stop(run_cpu_once, "cpu");
+          });
+          auto gpu_future = std::async(std::launch::async, [&]() {
+            return run_until_stop(run_gpu_once, "gpu");
+          });
+          auto npu_future = std::async(std::launch::async, [&]() {
+            return run_until_stop(run_npu_once, "npu");
+          });
+          auto power_future = sample_power_async();
+
+          auto sampled = power_future.get();
+          stop.store(true, std::memory_order_relaxed);
+          cpu_row = cpu_future.get();
+          gpu_row = gpu_future.get();
+          npu_row = npu_future.get();
+
+          rails = sampled.first;
+          power_note = sampled.second;
+          attach_power_sample(cpu_row, Options::Unit::CPU, rails, power_note);
+          attach_power_sample(gpu_row, Options::Unit::GPU, rails, power_note);
+          attach_power_sample(npu_row, Options::Unit::NPU, rails, power_note);
+        } else {
+          auto cpu_future = std::async(std::launch::async, [&]() { return run_cpu_once(); });
+          auto gpu_future = std::async(std::launch::async, [&]() { return run_gpu_once(); });
+          auto npu_future = std::async(std::launch::async, [&]() { return run_npu_once(); });
+          cpu_row = cpu_future.get();
+          gpu_row = gpu_future.get();
+          npu_row = npu_future.get();
+        }
+
+        print_row(cpu_row, show_watts);
+        print_row(gpu_row, show_watts);
+        print_row(npu_row, show_watts);
+
+        if (show_watts && rails.has_value()) {
+          const double total_watts =
+              rails->cpu.median.value_or(0.0) + rails->gpu.median.value_or(0.0) +
+              rails->ane.median.value_or(0.0);
+          BenchRow total;
+          total.n = n;
+          total.unit = "ALL rails";
+          total.precision = Precision::NA;
+          total.seconds = std::max({cpu_row.seconds, gpu_row.seconds, npu_row.seconds});
+          char buf[96];
+          std::snprintf(buf, sizeof(buf), "iter=%d | simultaneous total rail power=%.3fW", iter,
+                        total_watts);
+          total.note = buf;
+          print_row(total, true);
+        }
+      }
+      return 0;
+    }
 
     if (opt.unit == Options::Unit::GPU) {
       std::array<double, 4> baseline = {0.0, 0.0, 0.0, 0.0};
       std::array<int, 4> throttle_streak = {0, 0, 0, 0};
 
       for (int iter = 0; iter < opt.stress; iter++) {
-        std::string note;
-        if (show_watts) {
-          if (iter % opt.power_every == 0 || !cached_watts.has_value()) {
-            cached_watts = get_watts(note);
-            cached_power_note = note;
-          }
-        }
-
         bool stop = false;
         for (Precision p : opt.precisions) {
+          auto run_once = [&]() {
+            BenchRow row;
+            row.n = n;
+            row.note = "iter=" + std::to_string(iter);
+            std::string err;
+            if (!run_one_gpu(n, gpu_precision_from_precision(p), row, err)) {
+              row.n = n;
+              row.precision = p;
+              row.unit = (p == Precision::INT8) ? "GPU (MPS QMM)" : "GPU (simdgroup)";
+              row.note = "iter=" + std::to_string(iter) + " | " + err;
+            }
+            return row;
+          };
+
           BenchRow row;
-          row.n = n;
-          row.note = "iter=" + std::to_string(iter);
-          if (show_watts) {
-            row.watts = cached_watts;
-            if (!cached_power_note.empty()) row.note += " | " + cached_power_note;
+          const bool sample_power =
+              show_watts && (iter % opt.power_every == 0 || !cached_rails.has_value());
+          if (sample_power) {
+            PoweredBenchRow powered = run_with_power_sample(run_once, Options::Unit::GPU, "gpu");
+            row = powered.row;
+            cached_rails = powered.rails;
+            cached_power_note = powered.power_note;
+          } else {
+            row = run_once();
+            if (show_watts) {
+              attach_power_sample(row, Options::Unit::GPU, cached_rails, cached_power_note);
+              if (!cached_power_note.empty()) row.note += " | power_cached=1";
+            }
           }
 
-          std::string err;
-          if (!run_one_gpu(n, gpu_precision_from_precision(p), row, err)) {
-            row.note = err;
+          if (row.tflops <= 0.0) {
             print_row(row, show_watts);
             stop = true;
             break;
@@ -2044,13 +2309,6 @@ int main(int argc, char** argv) {
     if (opt.unit == Options::Unit::NPU) {
       std::array<double, 4> baseline = {0.0, 0.0, 0.0, 0.0};
       std::array<int, 4> throttle_streak = {0, 0, 0, 0};
-      auto sample_power_async = [&]() {
-        return std::async(std::launch::async, [&]() {
-          std::string note;
-          auto watts = get_watts(note);
-          return std::make_pair(watts, note);
-        });
-      };
       auto sample_process_gpu_async = [&]() {
         return std::async(std::launch::async, [&]() {
           std::string note;
@@ -2061,34 +2319,40 @@ int main(int argc, char** argv) {
 
       for (int iter = 0; iter < opt.stress; iter++) {
         for (Precision p : opt.precisions) {
-          BenchRow row;
-          row.n = n;
-          row.note = "iter=" + std::to_string(iter);
+          auto run_once = [&]() {
+            BenchRow row;
+            row.n = n;
+            row.note = "iter=" + std::to_string(iter);
+            std::string err;
+            if (!run_one_npu(n, p, row, err)) {
+              row.n = n;
+              row.precision = p;
+              row.unit = "NPU (private ANE)";
+              row.note = "iter=" + std::to_string(iter) + " | " + err;
+            }
+            return row;
+          };
 
           const bool sample_power =
-              show_watts && (iter % opt.power_every == 0 || !cached_watts.has_value());
-          std::future<std::pair<std::optional<double>, std::string>> power_future;
+              show_watts && (iter % opt.power_every == 0 || !cached_rails.has_value());
           std::future<std::pair<std::optional<double>, std::string>> process_gpu_future;
+          BenchRow row;
           if (sample_power) {
-            power_future = sample_power_async();
             process_gpu_future = sample_process_gpu_async();
-          }
-
-          std::string err;
-          const bool ok = run_one_npu(n, p, row, err);
-
-          if (sample_power) {
-            auto sampled = power_future.get();
-            cached_watts = sampled.first;
-            cached_power_note = sampled.second;
+            PoweredBenchRow powered = run_with_power_sample(run_once, Options::Unit::NPU, "npu");
+            row = powered.row;
+            cached_rails = powered.rails;
+            cached_power_note = powered.power_note;
             auto process_gpu = process_gpu_future.get();
             cached_process_gpu_note = process_gpu.second;
+          } else {
+            row = run_once();
           }
+
           if (show_watts) {
-            row.watts = cached_watts;
-            if (!cached_power_note.empty()) {
-              if (!row.note.empty()) row.note += " | ";
-              row.note += cached_power_note;
+            if (!sample_power) {
+              attach_power_sample(row, Options::Unit::NPU, cached_rails, cached_power_note);
+              if (!cached_power_note.empty()) row.note += " | power_cached=1";
             }
             if (!cached_process_gpu_note.empty()) {
               if (!row.note.empty()) row.note += " | ";
@@ -2096,12 +2360,7 @@ int main(int argc, char** argv) {
             }
           }
 
-          if (!ok) {
-            row.precision = p;
-            row.unit = "NPU (private ANE)";
-            row.note = err;
-            if (!cached_power_note.empty()) row.note += " | " + cached_power_note;
-            if (!cached_process_gpu_note.empty()) row.note += " | " + cached_process_gpu_note;
+          if (row.tflops <= 0.0) {
             print_row(row, show_watts);
             continue;
           }
@@ -2121,26 +2380,32 @@ int main(int argc, char** argv) {
     std::array<double, 4> baseline = {0.0, 0.0, 0.0, 0.0};
     std::array<int, 4> throttle_streak = {0, 0, 0, 0};
     for (int iter = 0; iter < opt.stress; iter++) {
-      std::string note;
-      if (show_watts) {
-        if (iter % opt.power_every == 0 || !cached_watts.has_value()) {
-          cached_watts = get_watts(note);
-          cached_power_note = note;
-        }
-      }
-
       const bool run_amx = (opt.mode == Options::Mode::AMX || opt.mode == Options::Mode::Both);
       for (Precision p : opt.precisions) {
-        BenchRow row;
-        row.n = n;
-        row.note = "iter=" + std::to_string(iter);
-        if (show_watts) {
-          row.watts = cached_watts;
-          if (!cached_power_note.empty()) row.note += " | " + cached_power_note;
-        }
-
         const auto which = (p == Precision::FP32 && !run_amx) ? Options::Mode::Ref : Options::Mode::AMX;
-        run_one_cpu(n, p, which, row);
+        auto run_once = [&]() {
+          BenchRow row;
+          row.n = n;
+          row.note = "iter=" + std::to_string(iter);
+          run_one_cpu(n, p, which, row);
+          return row;
+        };
+
+        BenchRow row;
+        const bool sample_power =
+            show_watts && (iter % opt.power_every == 0 || !cached_rails.has_value());
+        if (sample_power) {
+          PoweredBenchRow powered = run_with_power_sample(run_once, Options::Unit::CPU, "cpu");
+          row = powered.row;
+          cached_rails = powered.rails;
+          cached_power_note = powered.power_note;
+        } else {
+          row = run_once();
+          if (show_watts) {
+            attach_power_sample(row, Options::Unit::CPU, cached_rails, cached_power_note);
+            if (!cached_power_note.empty()) row.note += " | power_cached=1";
+          }
+        }
 
         const int idx = precision_index(p);
         baseline[idx] = std::max(baseline[idx], row.tflops);
@@ -2154,35 +2419,125 @@ int main(int argc, char** argv) {
   }
 
   if (opt.unit == Options::Unit::GPU) {
-    print_table_header(false);
+    const bool show_watts = (opt.power != Options::Power::None);
+    print_table_header(show_watts);
+    bool any_fail = false;
     for (Precision p : opt.precisions) {
-      BenchRow row;
-      std::string err;
-      if (!run_one_gpu(n, gpu_precision_from_precision(p), row, err)) {
-        std::cerr << "GPU benchmark failed: " << err << "\n";
-        return 2;
-      }
-      print_row(row, false);
+      auto run_once = [&]() {
+        BenchRow row;
+        std::string err;
+        if (!run_one_gpu(n, gpu_precision_from_precision(p), row, err)) {
+          row.n = n;
+          row.unit = (p == Precision::INT8) ? "GPU (MPS QMM)" : "GPU (simdgroup)";
+          row.precision = p;
+          row.note = err;
+        }
+        return row;
+      };
+      BenchRow row = run_with_power_sample(run_once, Options::Unit::GPU, "gpu").row;
+      if (row.tflops <= 0.0) any_fail = true;
+      print_row(row, show_watts);
     }
-    return 0;
+    return any_fail ? 2 : 0;
   }
 
   if (opt.unit == Options::Unit::NPU) {
     std::cout << "NPU/ANE private benchmark (conv1x1-chain; N=channels)\n";
-    print_table_header(false);
+    const bool show_watts = (opt.power != Options::Power::None);
+    print_table_header(show_watts);
     bool any_fail = false;
     for (Precision p : opt.precisions) {
-      BenchRow row;
-      std::string err;
-      if (!run_one_npu(n, p, row, err)) {
-        row.n = n;
-        row.unit = "NPU (private ANE)";
-        row.precision = p;
-        row.note = err;
-        any_fail = true;
-      }
-      print_row(row, false);
+      auto run_once = [&]() {
+        BenchRow row;
+        std::string err;
+        if (!run_one_npu(n, p, row, err)) {
+          row.n = n;
+          row.unit = "NPU (private ANE)";
+          row.precision = p;
+          row.note = err;
+        }
+        return row;
+      };
+      BenchRow row = run_with_power_sample(run_once, Options::Unit::NPU, "npu").row;
+      if (row.tflops <= 0.0) any_fail = true;
+      print_row(row, show_watts);
     }
+    return any_fail ? 2 : 0;
+  }
+
+  if (opt.unit == Options::Unit::ALL) {
+    constexpr int kDefaultNpuChannels = 512;
+    const std::array<Precision, 4> cpu_precisions = {
+        Precision::FP16, Precision::FP32, Precision::BF16, Precision::INT8};
+    const std::array<Precision, 3> gpu_precisions = {
+        Precision::FP16, Precision::FP32, Precision::BF16};
+    const std::array<Precision, 2> npu_precisions = {Precision::FP16, Precision::INT8};
+
+    const bool show_watts = (opt.power != Options::Power::None);
+    bool any_fail = false;
+    print_table_header(show_watts);
+
+    for (Precision p : cpu_precisions) {
+      if (!selected(p)) continue;
+      if (opt.verify) {
+        const CpuSmeVerifyResult verify = verify_cpu_sme_peak(p);
+        if (!verify.ok) {
+          std::cout << "verify(cpu_sme_peak): prec=" << precision_to_string(p);
+          if (p == Precision::INT8) {
+            std::cout << " diff_i32=" << verify.diff_i32;
+          } else {
+            std::cout << " diff=" << std::scientific << verify.diff;
+          }
+          std::cout << " FAILED\n";
+          any_fail = true;
+        }
+      }
+
+      auto run_once = [&]() {
+        BenchRow row;
+        run_one_cpu(n, p, Options::Mode::AMX, row);
+        return row;
+      };
+      BenchRow row = run_with_power_sample(run_once, Options::Unit::CPU, "cpu").row;
+      print_row(row, show_watts);
+    }
+
+    for (Precision p : gpu_precisions) {
+      if (!selected(p)) continue;
+      auto run_once = [&]() {
+        BenchRow row;
+        std::string err;
+        if (!run_one_gpu(n, gpu_precision_from_precision(p), row, err)) {
+          row.n = n;
+          row.unit = "GPU (simdgroup)";
+          row.precision = p;
+          row.note = err;
+        }
+        return row;
+      };
+      BenchRow row = run_with_power_sample(run_once, Options::Unit::GPU, "gpu").row;
+      if (row.tflops <= 0.0) any_fail = true;
+      print_row(row, show_watts);
+    }
+
+    for (Precision p : npu_precisions) {
+      if (!selected(p)) continue;
+      auto run_once = [&]() {
+        BenchRow row;
+        std::string err;
+        if (!run_one_npu(kDefaultNpuChannels, p, row, err)) {
+          row.n = kDefaultNpuChannels;
+          row.unit = "NPU (private ANE)";
+          row.precision = p;
+          row.note = err;
+        }
+        return row;
+      };
+      BenchRow row = run_with_power_sample(run_once, Options::Unit::NPU, "npu").row;
+      if (row.tflops <= 0.0) any_fail = true;
+      print_row(row, show_watts);
+    }
+
     return any_fail ? 2 : 0;
   }
 
@@ -2204,11 +2559,16 @@ int main(int argc, char** argv) {
     std::cout << "\n";
   }
 
-  print_table_header(false);
+  const bool show_watts = (opt.power != Options::Power::None);
+  print_table_header(show_watts);
   for (Precision p : opt.precisions) {
-    BenchRow row;
-    run_one_cpu(n, p, Options::Mode::AMX, row);
-    print_row(row, false);
+    auto run_once = [&]() {
+      BenchRow row;
+      run_one_cpu(n, p, Options::Mode::AMX, row);
+      return row;
+    };
+    BenchRow row = run_with_power_sample(run_once, Options::Unit::CPU, "cpu").row;
+    print_row(row, show_watts);
   }
 
   return 0;

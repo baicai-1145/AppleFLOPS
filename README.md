@@ -10,7 +10,31 @@ unzip MTFLOPS.zip
 cd MTFLOPS
 ```
 
-## 推荐一键跑分（GPU + 功耗 + 热降频提示）
+## 推荐一键跑分
+一次跑完当前可信支持矩阵：CPU FP32/FP16/BF16/INT8、GPU FP32/FP16/BF16、NPU FP16/INT8：
+```bash
+./mtflops --unit all --precision all --n 1024 --warmup 1 --repeats 3
+```
+其中 NPU 固定使用 `N=512` channels；GPU INT8 不在 `--unit all` 默认矩阵内，因为当前公开路径不是同口径的矩阵单元峰值。
+
+带全程功耗采样时需要 sudo；每一行 benchmark 会在 `powermetrics` 完整采样窗口内持续循环对应 workload，并从 `cpu_power` plist 同时读取 CPU/GPU/ANE 三条 rail。`Watts` 列按当前行所属硬件选择对应 rail 的 median，Note 中会显示 `median(cpu/gpu/ane)=...`、`avg`、`range` 和 `samples`：
+```bash
+sudo ./mtflops --unit all --precision all --n 1024 --warmup 1 --repeats 3 --power powermetrics --verify 0
+```
+
+如果想把 CPU/GPU/NPU 同时压起来，当作整机压力测试，用 `--unit all --stress`。开启功耗采样时，每轮会在 `--power-window-ms * --power-samples` 的完整采样期间持续循环 CPU、GPU、NPU 三个 workload，并同时采样三条功耗 rail：
+```bash
+sudo ./mtflops --unit all --precision fp16 --stress 10 --n 2048 --gpu-workload peak --gpu-inner 512 --gpu-batch 8 --warmup 0 --repeats 1 --power powermetrics --power-every 1 --verify 0
+```
+更稳定的功耗口径建议把采样窗口拉长并取多样本 median，例如：
+```bash
+sudo ./mtflops --unit all --precision fp16 --stress 5 --n 2048 --gpu-workload peak --gpu-inner 512 --gpu-batch 8 --warmup 0 --repeats 1 --power powermetrics --power-window-ms 3000 --power-samples 5 --power-every 1 --verify 0
+```
+`Watts` 列使用对应 rail 的 median；Note 中的 `range` 用于判断采样波动是否仍然过大。若 `range` 仍很宽，说明系统调度、DVFS、后台任务或被动散热状态仍在影响功耗口径。
+
+`--unit all --stress --power powermetrics` 默认会把 CPU SME worker 限到硬件线程数，避免默认 `MTFLOPS_CPU_THREADS=硬件线程数*6` 的 CPU 峰值探针挤占 ANE/GPU 提交线程和 `powermetrics` 采样线程。若你要纯粹最大 CPU 压力，可以显式设置 `MTFLOPS_CPU_THREADS=60`，但 ANE/GPU rail 的 `range` 可能会明显变宽，甚至短窗口内采到 0。
+
+## GPU + 功耗 + 热降频提示
 `powermetrics` 需要 sudo：
 ```bash
 sudo ./mtflops --unit gpu --precision all --gpu-workload gemm --kernel v4 --n 1024 --warmup 2 --repeats 5 --gpu-batch 32 --gpu-inner 16 --stress 10 --power powermetrics --power-every 2
@@ -49,7 +73,7 @@ sudo ./mtflops --unit npu --precision int8 --stress 2 --power powermetrics --pow
 在 MacBook Air M4 上，该配置实测约：
 - FP16: `18.57 TFLOPS`，`util_ref_m4=99.9%`
 - INT8 W8A8: `35.06 TOPS`，`util_ref_m4=99.9%`
-带 power 的 NPU stress 行会额外打印类似 `powermetrics(cpu_power plist key=ane_power interval=1000ms) | cpu=...W gpu=...W ane=...W | powermetrics(tasks) mtflops_gpu_ms_s=0.00`。这能证明 ANE dedicated rail 在工作，同时 `mtflops` 进程没有 GPU time；它不是 ANE 硬件占用率 counter。
+带 power 的 NPU stress 行会额外打印类似 `powermetrics(cpu_power plist rails interval=1000ms samples=3 median) | median(cpu/gpu/ane)=...W | ... | powermetrics(tasks) mtflops_gpu_ms_s=0.00`。这能证明 ANE dedicated rail 在工作，同时 `mtflops` 进程没有 GPU time；它不是 ANE 硬件占用率 counter。
 
 注意：
 - NPU 后端使用 Apple 私有 API：`AppleNeuralEngine.framework` / `_ANEInMemoryModel`，只适合研究用途。
