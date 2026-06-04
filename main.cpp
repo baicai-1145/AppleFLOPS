@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <future>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -18,12 +19,14 @@
 #include <string>
 #include <string_view>
 #include <sys/sysctl.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
 #include <arm_neon.h>
 
 #include "gpu_bench.h"
+#include "npu_bench.h"
 
 namespace {
 
@@ -41,7 +44,7 @@ struct BenchRow {
 };
 
 struct Options {
-  enum class Unit { CPU, GPU };
+  enum class Unit { CPU, GPU, NPU };
   enum class Mode { AMX, Ref, Both };
   enum class Power { None, Powermetrics };
   enum class GpuKernel { Auto, V4 };
@@ -55,6 +58,7 @@ struct Options {
   int repeats = 5;
   bool verify = true;
   bool precision_set = false;
+  bool n_set = false;
 
   std::vector<Precision> precisions;
   std::string gpu_shader_path = "shaders/gemm.metal";
@@ -63,6 +67,8 @@ struct Options {
   int gpu_batch = 1;
   int gpu_inner = 1;
   GpuWorkload gpu_workload = GpuWorkload::Gemm;
+  int npu_spatial = 64;
+  int npu_depth = 128;
 
   bool sweep = false;
   int sweep_min = 512;
@@ -112,6 +118,14 @@ GpuPrecision gpu_precision_from_precision(Precision p) {
   die("invalid GPU precision");
 }
 
+NpuPrecision npu_precision_from_precision(Precision p) {
+  if (p == Precision::FP16) return NpuPrecision::FP16;
+  if (p == Precision::FP32) return NpuPrecision::FP32;
+  if (p == Precision::BF16) return NpuPrecision::BF16;
+  if (p == Precision::INT8) return NpuPrecision::INT8;
+  die("invalid NPU precision");
+}
+
 int precision_index(Precision p) {
   if (p == Precision::FP16) return 0;
   if (p == Precision::FP32) return 1;
@@ -143,7 +157,7 @@ Options parse_args(int argc, char** argv) {
       std::cout
           << "MTFLOPS (Stage 1/2: CPU AMX + Metal GPU)\n\n"
           << "Usage:\n"
-          << "  ./mtflops [--unit cpu|gpu] [--mode amx|ref|both] [--precision fp16|fp32|bf16|int8|both|all]\n"
+          << "  ./mtflops [--unit cpu|gpu|npu] [--mode amx|ref|both] [--precision fp16|fp32|bf16|int8|both|all]\n"
           << "           [--n N] [--warmup W] [--repeats R] [--verify 0|1]\n"
           << "           [--shader <path>]\n\n"
           << "           [--sweep 0|1] [--sweep-min N] [--sweep-max N]\n"
@@ -153,15 +167,19 @@ Options parse_args(int argc, char** argv) {
           << "           [--gpu-storage shared|private] [--gpu-batch B]\n\n"
           << "           [--gpu-inner I]  (I>1 为 compute-amplified，趋近理论峰值用)\n\n"
           << "           [--gpu-workload gemm|peak]\n\n"
+          << "           [--npu-spatial S] [--npu-depth D]\n\n"
           << "Notes:\n"
           << "  - GEMM 口径：浮点按 2*N^3 计 TFLOPS；INT8 按 2*N^3 计 TOPS。\n"
-          << "  - FP32 AMX 路径通过 Accelerate 的 cblas_sgemm 触发；CPU FP16/INT8 优先使用 NEON，BF16 使用 verified typed kernel。\n";
+          << "  - FP32 AMX 路径通过 Accelerate 的 cblas_sgemm 触发；CPU FP16 使用 NEON，BF16 使用 verified typed kernel。\n"
+          << "  - CPU INT8 使用 I8MM tiled GEMM microkernel；无 I8MM 时退回 verified scalar GEMM。\n"
+          << "  - NPU 使用 private ANE conv1x1-chain：N=channels，--npu-spatial/--npu-depth 控制工作量。\n";
       std::exit(0);
     } else if (a == "--unit") {
       auto v = need_value("--unit");
       if (v == "cpu") opt.unit = Options::Unit::CPU;
       else if (v == "gpu") opt.unit = Options::Unit::GPU;
-      else die("--unit must be one of: cpu, gpu");
+      else if (v == "npu" || v == "ane") opt.unit = Options::Unit::NPU;
+      else die("--unit must be one of: cpu, gpu, npu");
     } else if (a == "--mode") {
       auto v = need_value("--mode");
       if (v == "amx") opt.mode = Options::Mode::AMX;
@@ -195,6 +213,14 @@ Options parse_args(int argc, char** argv) {
       if (v == "gemm") opt.gpu_workload = Options::GpuWorkload::Gemm;
       else if (v == "peak") opt.gpu_workload = Options::GpuWorkload::Peak;
       else die("--gpu-workload must be one of: gemm, peak");
+    } else if (a == "--npu-spatial") {
+      int v = 0;
+      if (!parse_int(need_value("--npu-spatial"), v) || v <= 0) die("--npu-spatial must be > 0");
+      opt.npu_spatial = v;
+    } else if (a == "--npu-depth") {
+      int v = 0;
+      if (!parse_int(need_value("--npu-depth"), v) || v <= 0) die("--npu-depth must be > 0");
+      opt.npu_depth = v;
     } else if (a == "--shader") {
       opt.gpu_shader_path = std::string(need_value("--shader"));
     } else if (a == "--sweep") {
@@ -226,6 +252,7 @@ Options parse_args(int argc, char** argv) {
       int v = 0;
       if (!parse_int(need_value("--n"), v) || v <= 0) die("--n must be a positive integer");
       opt.n = v;
+      opt.n_set = true;
     } else if (a == "--warmup") {
       int v = 0;
       if (!parse_int(need_value("--warmup"), v) || v < 0) die("--warmup must be >= 0");
@@ -243,9 +270,11 @@ Options parse_args(int argc, char** argv) {
     }
   }
   if (!opt.precision_set) {
-    opt.precisions = (opt.unit == Options::Unit::GPU) ? std::vector<Precision>{Precision::FP16}
-                                                      : std::vector<Precision>{Precision::FP32};
+    if (opt.unit == Options::Unit::GPU) opt.precisions = {Precision::FP16};
+    else if (opt.unit == Options::Unit::NPU) opt.precisions = {Precision::FP16, Precision::INT8};
+    else opt.precisions = {Precision::FP32};
   }
+  if (opt.unit == Options::Unit::NPU && !opt.n_set) opt.n = 512;
   return opt;
 }
 
@@ -269,8 +298,8 @@ bool cpu_has_fp16() {
   return yes;
 }
 
-bool cpu_has_dotprod() {
-  static const bool yes = cpu_feature_enabled("hw.optional.arm.FEAT_DotProd");
+bool cpu_has_i8mm() {
+  static const bool yes = cpu_feature_enabled("hw.optional.arm.FEAT_I8MM");
   return yes;
 }
 
@@ -517,22 +546,6 @@ float dot_fp16_neon(const __fp16* a, const __fp16* b, int n) {
   return sum;
 }
 
-__attribute__((target("dotprod")))
-int32_t dot_int8_neon(const int8_t* a, const int8_t* b, int n) {
-  int32x4_t acc = vdupq_n_s32(0);
-  int k = 0;
-  for (; k + 16 <= n; k += 16) {
-    const int8x16_t av = vld1q_s8(a + k);
-    const int8x16_t bv = vld1q_s8(b + k);
-    acc = vdotq_s32(acc, av, bv);
-  }
-  int32_t sum = vaddvq_s32(acc);
-  for (; k < n; k++) {
-    sum += static_cast<int32_t>(a[k]) * static_cast<int32_t>(b[k]);
-  }
-  return sum;
-}
-
 void gemm_fp16_neon_pretransposed(const __fp16* a, const __fp16* bt, float* c, int n) {
   for (int i = 0; i < n; i++) {
     const __fp16* a_row = a + static_cast<size_t>(i) * n;
@@ -543,14 +556,168 @@ void gemm_fp16_neon_pretransposed(const __fp16* a, const __fp16* bt, float* c, i
   }
 }
 
-void gemm_int8_neon_pretransposed(const int8_t* a, const int8_t* bt, int32_t* c, int n) {
-  for (int i = 0; i < n; i++) {
+size_t i8mm_bpack_size(int n) {
+  const size_t j_tiles = static_cast<size_t>(n / 4);
+  const size_t k_blocks = static_cast<size_t>(n / 8);
+  return j_tiles * k_blocks * 32u;
+}
+
+void pack_b_int8_i8mm_4col(const int8_t* b, int8_t* bpack, int n) {
+  const int j_tiles = n / 4;
+  const int k_blocks = n / 8;
+  for (int jt = 0; jt < j_tiles; jt++) {
+    const int j0 = jt * 4;
+    for (int kb = 0; kb < k_blocks; kb++) {
+      const int k0 = kb * 8;
+      int8_t* dst = bpack + (static_cast<size_t>(jt) * k_blocks + kb) * 32u;
+      for (int kk = 0; kk < 8; kk++) {
+        const int8_t* brow = b + static_cast<size_t>(k0 + kk) * n + j0;
+        dst[kk] = brow[0];
+        dst[8 + kk] = brow[1];
+        dst[16 + kk] = brow[2];
+        dst[24 + kk] = brow[3];
+      }
+    }
+  }
+}
+
+inline void store_i8mm_2x2(int32x4_t acc, int32_t* c, int n, int row, int col) {
+  c[static_cast<size_t>(row) * n + col] = vgetq_lane_s32(acc, 0);
+  c[static_cast<size_t>(row) * n + col + 1] = vgetq_lane_s32(acc, 1);
+  c[static_cast<size_t>(row + 1) * n + col] = vgetq_lane_s32(acc, 2);
+  c[static_cast<size_t>(row + 1) * n + col + 1] = vgetq_lane_s32(acc, 3);
+}
+
+__attribute__((target("i8mm")))
+void gemm_int8_i8mm_4x4_kernel(const int8_t* a, const int8_t* bpack, int32_t* c, int n,
+                               int k_blocks) {
+  int32x4_t c00 = vdupq_n_s32(0);
+  int32x4_t c02 = vdupq_n_s32(0);
+  int32x4_t c20 = vdupq_n_s32(0);
+  int32x4_t c22 = vdupq_n_s32(0);
+
+  for (int kb = 0; kb < k_blocks; kb++) {
+    const int k0 = kb * 8;
+    const int8x8_t a0 = vld1_s8(a + 0 * n + k0);
+    const int8x8_t a1 = vld1_s8(a + 1 * n + k0);
+    const int8x8_t a2 = vld1_s8(a + 2 * n + k0);
+    const int8x8_t a3 = vld1_s8(a + 3 * n + k0);
+    const int8x16_t a01 = vcombine_s8(a0, a1);
+    const int8x16_t a23 = vcombine_s8(a2, a3);
+    const int8_t* bp = bpack + static_cast<size_t>(kb) * 32u;
+    const int8x16_t b01 = vld1q_s8(bp);
+    const int8x16_t b23 = vld1q_s8(bp + 16);
+
+    c00 = vmmlaq_s32(c00, a01, b01);
+    c02 = vmmlaq_s32(c02, a01, b23);
+    c20 = vmmlaq_s32(c20, a23, b01);
+    c22 = vmmlaq_s32(c22, a23, b23);
+  }
+
+  store_i8mm_2x2(c00, c, n, 0, 0);
+  store_i8mm_2x2(c02, c, n, 0, 2);
+  store_i8mm_2x2(c20, c, n, 2, 0);
+  store_i8mm_2x2(c22, c, n, 2, 2);
+}
+
+void add_int8_tail_k_4x4(const int8_t* a, const int8_t* b, int32_t* c, int n, int k0, int j0) {
+  for (int r = 0; r < 4; r++) {
+    for (int col = 0; col < 4; col++) {
+      int32_t sum = c[static_cast<size_t>(r) * n + col];
+      for (int k = k0; k < n; k++) {
+        sum += static_cast<int32_t>(a[static_cast<size_t>(r) * n + k]) *
+               static_cast<int32_t>(b[static_cast<size_t>(k) * n + j0 + col]);
+      }
+      c[static_cast<size_t>(r) * n + col] = sum;
+    }
+  }
+}
+
+void gemm_int8_i8mm_prepacked_row_tiles(const int8_t* a, const int8_t* b, const int8_t* bpack,
+                                        int32_t* c, int n, int tile_begin, int tile_end) {
+  const int j_tiles = n / 4;
+  const int k_blocks = n / 8;
+  const int k_tail = k_blocks * 8;
+  const int j_main = j_tiles * 4;
+
+  for (int it = tile_begin; it < tile_end; it++) {
+    const int i = it * 4;
+    const int8_t* a_tile = a + static_cast<size_t>(i) * n;
+    int32_t* c_tile = c + static_cast<size_t>(i) * n;
+    for (int jt = 0; jt < j_tiles; jt++) {
+      const int j = jt * 4;
+      int32_t* c_block = c_tile + j;
+      if (k_blocks > 0) {
+        const int8_t* bp = bpack + static_cast<size_t>(jt) * k_blocks * 32u;
+        gemm_int8_i8mm_4x4_kernel(a_tile, bp, c_block, n, k_blocks);
+      } else {
+        for (int r = 0; r < 4; r++) {
+          for (int col = 0; col < 4; col++) c_block[static_cast<size_t>(r) * n + col] = 0;
+        }
+      }
+      if (k_tail < n) add_int8_tail_k_4x4(a_tile, b, c_block, n, k_tail, j);
+    }
+
+    for (int r = 0; r < 4; r++) {
+      const int8_t* a_row = a + static_cast<size_t>(i + r) * n;
+      int32_t* c_row = c + static_cast<size_t>(i + r) * n;
+      for (int j = j_main; j < n; j++) {
+        int32_t sum = 0;
+        for (int k = 0; k < n; k++) {
+          sum += static_cast<int32_t>(a_row[k]) * static_cast<int32_t>(b[static_cast<size_t>(k) * n + j]);
+        }
+        c_row[j] = sum;
+      }
+    }
+  }
+}
+
+void gemm_int8_scalar_tail_rows(const int8_t* a, const int8_t* b, int32_t* c, int n, int i_begin) {
+  for (int i = i_begin; i < n; i++) {
     const int8_t* a_row = a + static_cast<size_t>(i) * n;
     int32_t* c_row = c + static_cast<size_t>(i) * n;
     for (int j = 0; j < n; j++) {
-      c_row[j] = dot_int8_neon(a_row, bt + static_cast<size_t>(j) * n, n);
+      int32_t sum = 0;
+      for (int k = 0; k < n; k++) {
+        sum += static_cast<int32_t>(a_row[k]) * static_cast<int32_t>(b[static_cast<size_t>(k) * n + j]);
+      }
+      c_row[j] = sum;
     }
   }
+}
+
+int gemm_int8_i8mm_tiled_prepacked_threaded(const int8_t* a, const int8_t* b, const int8_t* bpack,
+                                            int32_t* c, int n) {
+  const int row_tiles = n / 4;
+  const int tail_row_begin = row_tiles * 4;
+  const unsigned hw_threads = std::thread::hardware_concurrency();
+  const int threads = std::max(1, std::min(row_tiles, static_cast<int>(std::max(1u, hw_threads))));
+
+  if (row_tiles > 0) {
+    if (threads == 1) {
+      gemm_int8_i8mm_prepacked_row_tiles(a, b, bpack, c, n, 0, row_tiles);
+    } else {
+      std::vector<std::thread> workers;
+      workers.reserve(static_cast<size_t>(threads));
+      for (int t = 0; t < threads; t++) {
+        const int begin = row_tiles * t / threads;
+        const int end = row_tiles * (t + 1) / threads;
+        workers.emplace_back([=]() {
+          gemm_int8_i8mm_prepacked_row_tiles(a, b, bpack, c, n, begin, end);
+        });
+      }
+      for (auto& w : workers) w.join();
+    }
+  }
+
+  if (tail_row_begin < n) gemm_int8_scalar_tail_rows(a, b, c, n, tail_row_begin);
+  return threads;
+}
+
+void gemm_int8_i8mm_tiled(const int8_t* a, const int8_t* b, int32_t* c, int n) {
+  std::vector<int8_t> bpack(i8mm_bpack_size(n));
+  if (!bpack.empty()) pack_b_int8_i8mm_4col(b, bpack.data(), n);
+  gemm_int8_i8mm_tiled_prepacked_threaded(a, b, bpack.data(), c, n);
 }
 
 double seconds_since(const std::chrono::high_resolution_clock::time_point& start,
@@ -565,7 +732,17 @@ double tflops_for_gemm(int n, double seconds) {
   return flops / seconds / 1e12;
 }
 
-struct RunResult { double best_seconds = 0.0; double tflops = 0.0; };
+uint64_t ops_for_gemm_u64(int n) {
+  const uint64_t nn = static_cast<uint64_t>(n);
+  return 2ull * nn * nn * nn;
+}
+
+struct RunResult {
+  double best_seconds = 0.0;
+  double tflops = 0.0;
+  uint64_t ops = 0;
+  int threads = 1;
+};
 
 template <typename Fn>
 RunResult bench_gemm(Fn&& fn, const float* a, const float* b, float* c, int n, int warmup,
@@ -583,6 +760,7 @@ RunResult bench_gemm(Fn&& fn, const float* a, const float* b, float* c, int n, i
   RunResult r;
   r.best_seconds = best;
   r.tflops = tflops_for_gemm(n, best);
+  r.ops = ops_for_gemm_u64(n);
   return r;
 }
 
@@ -601,6 +779,7 @@ RunResult bench_callable(Fn&& fn, int n, int warmup, int repeats) {
   RunResult r;
   r.best_seconds = best;
   r.tflops = tflops_for_gemm(n, best);
+  r.ops = ops_for_gemm_u64(n);
   return r;
 }
 
@@ -661,24 +840,99 @@ std::string metric_to_string(Precision p) {
   return (p == Precision::INT8) ? "TOPS" : "TFLOPS";
 }
 
-std::optional<double> read_power_watts_powermetrics(std::string& note) {
+const char* power_key_for_unit(Options::Unit unit) {
+  switch (unit) {
+    case Options::Unit::CPU: return "cpu_power";
+    case Options::Unit::GPU: return "gpu_power";
+    case Options::Unit::NPU: return "ane_power";
+  }
+  return "cpu_power";
+}
+
+const char* power_unit_name(Options::Unit unit) {
+  switch (unit) {
+    case Options::Unit::CPU: return "cpu";
+    case Options::Unit::GPU: return "gpu";
+    case Options::Unit::NPU: return "ane";
+  }
+  return "cpu";
+}
+
+std::optional<double> parse_plist_power_watts(const std::string& text, const char* key) {
+  const std::string marker = std::string("<key>") + key + "</key>";
+  std::optional<double> last;
+  size_t pos = 0;
+  while ((pos = text.find(marker, pos)) != std::string::npos) {
+    const size_t value_start = pos + marker.size();
+    const size_t next_key = text.find("<key>", value_start);
+    const size_t real_pos = text.find("<real>", value_start);
+    const size_t int_pos = text.find("<integer>", value_start);
+
+    size_t tag_pos = std::string::npos;
+    const char* open_tag = nullptr;
+    const char* close_tag = nullptr;
+    if (real_pos != std::string::npos && (next_key == std::string::npos || real_pos < next_key)) {
+      tag_pos = real_pos;
+      open_tag = "<real>";
+      close_tag = "</real>";
+    }
+    if (int_pos != std::string::npos && (next_key == std::string::npos || int_pos < next_key) &&
+        (tag_pos == std::string::npos || int_pos < tag_pos)) {
+      tag_pos = int_pos;
+      open_tag = "<integer>";
+      close_tag = "</integer>";
+    }
+    if (!open_tag) {
+      pos = value_start;
+      continue;
+    }
+
+    const size_t number_start = tag_pos + std::strlen(open_tag);
+    const size_t number_end = text.find(close_tag, number_start);
+    if (number_end == std::string::npos) {
+      pos = number_start;
+      continue;
+    }
+    const std::string number = text.substr(number_start, number_end - number_start);
+    char* endp = nullptr;
+    const double mw = std::strtod(number.c_str(), &endp);
+    if (endp != number.c_str() && std::isfinite(mw) && mw >= 0.0 && mw < 200000.0) {
+      last = mw / 1000.0;
+    }
+    pos = number_end + std::strlen(close_tag);
+  }
+  return last;
+}
+
+void append_power_rail_note(std::string& note, const std::string& sample) {
+  const auto cpu = parse_plist_power_watts(sample, "cpu_power");
+  const auto gpu = parse_plist_power_watts(sample, "gpu_power");
+  const auto ane = parse_plist_power_watts(sample, "ane_power");
+  char buf[160];
+  std::snprintf(buf, sizeof(buf), "cpu=%.3fW gpu=%.3fW ane=%.3fW",
+                cpu.value_or(0.0), gpu.value_or(0.0), ane.value_or(0.0));
+  note += " | ";
+  note += buf;
+}
+
+int run_command_capture(const std::string& cmd, std::string& out) {
+  FILE* fp = popen(cmd.c_str(), "r");
+  if (!fp) return -1;
+  char buf[4096];
+  while (std::fgets(buf, sizeof(buf), fp)) out += buf;
+  return pclose(fp);
+}
+
+std::optional<double> read_power_watts_powermetrics(Options::Unit unit, std::string& note) {
   // powermetrics 通常需要 sudo。这里仅在用户显式启用 `--power powermetrics` 时尝试读取，
   // 失败则返回空并给出 note（避免影响基准测试主流程）。
   if (geteuid() != 0) {
     note = "powermetrics 需要 sudo（用 sudo 运行本程序后再启用 --power powermetrics）";
     return std::nullopt;
   }
-  auto run_cmd = [](const char* cmd, std::string& out) -> int {
-    FILE* fp = popen(cmd, "r");
-    if (!fp) return -1;
-    char buf[4096];
-    while (std::fgets(buf, sizeof(buf), fp)) out += buf;
-    const int rc = pclose(fp);
-    return rc;
-  };
 
-  auto parse_gpu_watts = [](const std::string& text) -> std::optional<double> {
-    // 逐行：找包含 gpu 且包含 W/mW 的行，提取第一个数值。
+  auto parse_text_watts = [](const std::string& text, const char* needle) -> std::optional<double> {
+    // 逐行：找包含目标 rail 名称且包含 W/mW 的行，提取第一个数值。
     size_t start = 0;
     while (start < text.size()) {
       size_t end = text.find('\n', start);
@@ -688,7 +942,7 @@ std::optional<double> read_power_watts_powermetrics(std::string& note) {
 
       std::string lower = line;
       for (char& ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-      if (lower.find("gpu") == std::string::npos) continue;
+      if (lower.find(needle) == std::string::npos) continue;
 
       const bool has_mw = (lower.find("mw") != std::string::npos);
       const bool has_w = (lower.find('w') != std::string::npos);
@@ -707,29 +961,117 @@ std::optional<double> read_power_watts_powermetrics(std::string& note) {
     return std::nullopt;
   };
 
-  // 优先尝试 gpu_power sampler（部分系统字段更直接），失败再退回 smc sampler。
+  const char* key = power_key_for_unit(unit);
+  const char* name = power_unit_name(unit);
+  const int interval_ms = (unit == Options::Unit::NPU) ? 1000 : 200;
+
+  // cpu_power 的 plist 在本机同时包含 cpu_power/gpu_power/ane_power，且单位为 mW。
+  // 这是 NPU/ANE rail 当前可解析的最小 sampler。
   {
     std::string out;
-    const int rc = run_cmd("powermetrics --samplers gpu_power -n 1 -i 200 2>&1", out);
+    const std::string cmd =
+        "powermetrics --samplers cpu_power -f plist -n 1 -i " + std::to_string(interval_ms) + " 2>&1";
+    const int rc = run_command_capture(cmd, out);
     if (rc == 0) {
-      if (auto w = parse_gpu_watts(out)) {
-        note = "powermetrics(gpu_power)";
-        return w;
-      }
-    }
-  }
-  {
-    std::string out;
-    const int rc = run_cmd("powermetrics --samplers smc -n 1 -i 200 2>&1", out);
-    if (rc == 0) {
-      if (auto w = parse_gpu_watts(out)) {
-        note = "powermetrics(smc)";
+      if (auto w = parse_plist_power_watts(out, key)) {
+        note = "powermetrics(cpu_power plist key=" + std::string(key) + " interval=" +
+               std::to_string(interval_ms) + "ms)";
+        append_power_rail_note(note, out);
         return w;
       }
     }
   }
 
-  note = "powermetrics 未解析到 GPU 功耗字段";
+  // GPU 仍保留文本 gpu_power 回退；ANE 的 ane_power 文本 sampler 在本机只输出采样头。
+  if (unit == Options::Unit::GPU) {
+    std::string out;
+    const std::string cmd =
+        "powermetrics --samplers gpu_power -n 1 -i " + std::to_string(interval_ms) + " 2>&1";
+    const int rc = run_command_capture(cmd, out);
+    if (rc == 0) {
+      if (auto w = parse_text_watts(out, name)) {
+        note = "powermetrics(gpu_power text)";
+        return w;
+      }
+    }
+  }
+
+  {
+    std::string out;
+    const std::string cmd =
+        "powermetrics --samplers smc -n 1 -i " + std::to_string(interval_ms) + " 2>&1";
+    const int rc = run_command_capture(cmd, out);
+    if (rc == 0) {
+      if (auto w = parse_text_watts(out, name)) {
+        note = "powermetrics(smc text)";
+        return w;
+      }
+    }
+  }
+
+  note = "powermetrics 未解析到 " + std::string(key) + " 功耗字段";
+  return std::nullopt;
+}
+
+std::optional<double> parse_process_gpu_ms_s(const std::string& text, const char* process_name) {
+  size_t start = 0;
+  while (start < text.size()) {
+    size_t end = text.find('\n', start);
+    if (end == std::string::npos) end = text.size();
+    const std::string line = text.substr(start, end - start);
+    start = end + 1;
+
+    size_t i = 0;
+    while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i]))) i++;
+    const size_t name_len = std::strlen(process_name);
+    if (line.compare(i, name_len, process_name) != 0) continue;
+    if (i + name_len < line.size() &&
+        !std::isspace(static_cast<unsigned char>(line[i + name_len]))) {
+      continue;
+    }
+
+    bool any = false;
+    double last = 0.0;
+    const char* p = line.c_str() + i + name_len;
+    while (*p) {
+      while (*p && !std::isdigit(static_cast<unsigned char>(*p)) && *p != '-' && *p != '+'
+             && *p != '.') {
+        p++;
+      }
+      if (!*p) break;
+      char* endp = nullptr;
+      const double v = std::strtod(p, &endp);
+      if (endp != p && std::isfinite(v)) {
+        last = v;
+        any = true;
+        p = endp;
+      } else {
+        p++;
+      }
+    }
+    if (any) return last;
+  }
+  return std::nullopt;
+}
+
+std::optional<double> read_process_gpu_ms_powermetrics(std::string& note) {
+  if (geteuid() != 0) {
+    note = "process_gpu 需要 sudo";
+    return std::nullopt;
+  }
+
+  std::string out;
+  const int rc = run_command_capture(
+      "powermetrics --samplers tasks --show-process-gpu -n 1 -i 1000 2>&1", out);
+  if (rc == 0) {
+    if (auto gpu = parse_process_gpu_ms_s(out, "mtflops")) {
+      char buf[96];
+      std::snprintf(buf, sizeof(buf), "powermetrics(tasks) mtflops_gpu_ms_s=%.2f", *gpu);
+      note = buf;
+      return gpu;
+    }
+  }
+  note = "powermetrics 未解析到 mtflops GPU ms/s";
   return std::nullopt;
 }
 
@@ -930,19 +1272,16 @@ bool verify_cpu_precision(Precision p, int n, double& diff, int64_t& diff_i32) {
 
   int8_t* a = aligned_alloc_64<int8_t>(nn);
   int8_t* b = aligned_alloc_64<int8_t>(nn);
-  int8_t* bt = aligned_alloc_64<int8_t>(nn);
   int32_t* c1 = aligned_alloc_64<int32_t>(nn);
   int32_t* c2 = aligned_alloc_64<int32_t>(nn);
   fill_matrix_int8(a, n, 123);
   fill_matrix_int8(b, n, 456);
-  transpose_square(b, bt, n);
-  if (cpu_has_dotprod()) gemm_int8_neon_pretransposed(a, bt, c1, n);
+  if (cpu_has_i8mm()) gemm_int8_i8mm_tiled(a, b, c1, n);
   else gemm_int8_blocked(a, b, c1, n);
   gemm_int8_ref_plain(a, b, c2, n);
   diff_i32 = max_abs_diff_i32(c1, c2, n);
   std::free(a);
   std::free(b);
-  std::free(bt);
   std::free(c1);
   std::free(c2);
   return diff_i32 == 0;
@@ -956,6 +1295,8 @@ int main(int argc, char** argv) {
   print_logo();
   if (opt.unit == Options::Unit::GPU && opt.gpu_workload == Options::GpuWorkload::Peak) {
     std::cout << "Peak score: FP/BF16 use matrix-unit FLOPs; INT8 uses a scalar TOPS probe.\n\n";
+  } else if (opt.unit == Options::Unit::NPU) {
+    std::cout << "NPU score: private ANE conv1x1-chain operations (FP/BF16/FP32 => TFLOPS, INT8 => TOPS)\n\n";
   } else {
     std::cout << "GEMM score: 2*N^3 operations (FP/BF16 => TFLOPS, INT8 => TOPS)\n\n";
   }
@@ -966,7 +1307,7 @@ int main(int argc, char** argv) {
 
   auto get_watts = [&](std::string& note) -> std::optional<double> {
     if (opt.power == Options::Power::None) return std::nullopt;
-    if (opt.power == Options::Power::Powermetrics) return read_power_watts_powermetrics(note);
+    if (opt.power == Options::Power::Powermetrics) return read_power_watts_powermetrics(opt.unit, note);
     return std::nullopt;
   };
 
@@ -983,6 +1324,11 @@ int main(int argc, char** argv) {
                                                                      : GpuStorageMode::Shared;
     gopt.workload = (opt.gpu_workload == Options::GpuWorkload::Peak) ? GpuWorkload::Peak
                                                                      : GpuWorkload::Gemm;
+    const bool mps_int8_gemm = (precision == GpuPrecision::INT8 && gopt.workload == GpuWorkload::Gemm);
+    if (mps_int8_gemm) {
+      gopt.batch = 1;
+      gopt.inner = 1;
+    }
     if (opt.gpu_kernel == Options::GpuKernel::V4) gopt.kernel = GpuKernelVariant::V4;
     else gopt.kernel = GpuKernelVariant::Auto;
 
@@ -1062,7 +1408,11 @@ int main(int argc, char** argv) {
     if (!run_gpu_bench(gopt, gout, err)) return false;
 
     row.n = size;
-    row.unit = (precision == GpuPrecision::INT8) ? "GPU (Metal)" : "GPU (simdgroup)";
+    if (precision == GpuPrecision::INT8) {
+      row.unit = (gout.backend == "mps-qmm-i32") ? "GPU (MPS QMM)" : "GPU (Metal scalar)";
+    } else {
+      row.unit = "GPU (simdgroup)";
+    }
     row.precision = row_precision;
     row.seconds = gout.best_seconds;
     row.tflops = gout.score;
@@ -1072,11 +1422,18 @@ int main(int argc, char** argv) {
       if (!row.note.empty()) row.note += " | ";
       row.note += k;
     }
-    if (opt.gpu_batch > 1) {
+    if (!gout.backend.empty()) {
+      if (!row.note.empty()) row.note += " | ";
+      row.note += "backend=" + gout.backend;
+    }
+    if (mps_int8_gemm && (opt.gpu_batch > 1 || opt.gpu_inner > 1)) {
+      if (!row.note.empty()) row.note += " | ";
+      row.note += "batch/inner ignored";
+    } else if (opt.gpu_batch > 1) {
       if (!row.note.empty()) row.note += " | ";
       row.note += "batch=" + std::to_string(opt.gpu_batch);
     }
-    if (opt.gpu_inner > 1) {
+    if (!mps_int8_gemm && opt.gpu_inner > 1) {
       if (!row.note.empty()) row.note += " | ";
       row.note += "inner=" + std::to_string(opt.gpu_inner);
     }
@@ -1084,6 +1441,40 @@ int main(int argc, char** argv) {
       if (!row.note.empty()) row.note += " | ";
       row.note += "workload=peak";
     }
+    return true;
+  };
+
+  auto run_one_npu = [&](int channels, Precision precision, BenchRow& row, std::string& err) -> bool {
+    NpuBenchOptions nopt;
+    nopt.channels = channels;
+    nopt.spatial = opt.npu_spatial;
+    nopt.depth = opt.npu_depth;
+    nopt.warmup = opt.warmup;
+    nopt.repeats = opt.repeats;
+    nopt.precision = npu_precision_from_precision(precision);
+
+    NpuBenchResult nout;
+    if (!run_npu_bench(nopt, nout, err)) return false;
+
+    row.n = channels;
+    row.unit = "NPU (private ANE)";
+    row.precision = precision;
+    row.seconds = nout.best_seconds;
+    row.tflops = nout.score;
+    if (!nout.backend.empty()) {
+      if (!row.note.empty()) row.note += " | ";
+      row.note += "backend=" + nout.backend;
+    }
+    if (!nout.note.empty()) {
+      if (!row.note.empty()) row.note += " | ";
+      row.note += nout.note;
+    }
+    if (nout.npu_only) {
+      if (!row.note.empty()) row.note += " | ";
+      row.note += "npu_only=private_ane_eval";
+    }
+    row.note += " | spatial=" + std::to_string(opt.npu_spatial);
+    row.note += " | depth=" + std::to_string(opt.npu_depth);
     return true;
   };
 
@@ -1154,27 +1545,41 @@ int main(int argc, char** argv) {
       std::free(b);
       std::free(c);
     } else {
-      int8_t* a = aligned_alloc_64<int8_t>(nn);
-      int8_t* b = aligned_alloc_64<int8_t>(nn);
-      int8_t* bt = aligned_alloc_64<int8_t>(nn);
-      int32_t* c = aligned_alloc_64<int32_t>(nn);
-      fill_matrix_int8(a, size, 1);
-      fill_matrix_int8(b, size, 2);
-      transpose_square(b, bt, size);
-      const bool fast = cpu_has_dotprod();
-      if (fast) {
-        r = bench_callable([&]() { gemm_int8_neon_pretransposed(a, bt, c, size); }, size, opt.warmup,
-                           repeats);
+      if (cpu_has_i8mm()) {
+        std::vector<int8_t> bpack(i8mm_bpack_size(size));
+        int8_t* a = aligned_alloc_64<int8_t>(nn);
+        int8_t* b = aligned_alloc_64<int8_t>(nn);
+        int32_t* c = aligned_alloc_64<int32_t>(nn);
+        fill_matrix_int8(a, size, 1);
+        fill_matrix_int8(b, size, 2);
+        if (!bpack.empty()) pack_b_int8_i8mm_4col(b, bpack.data(), size);
+        int used_threads = 1;
+        r = bench_callable([&]() {
+          used_threads = gemm_int8_i8mm_tiled_prepacked_threaded(a, b, bpack.data(), c, size);
+        }, size, opt.warmup, repeats);
+        r.threads = used_threads;
+        row.unit = "CPU I8MM GEMM";
+        add_note("smmla tiled 4x4");
+        add_note("int32 accumulate");
+        add_note("threads=" + std::to_string(r.threads));
+        add_note("B prepacked");
+        std::free(a);
+        std::free(b);
+        std::free(c);
       } else {
+        int8_t* a = aligned_alloc_64<int8_t>(nn);
+        int8_t* b = aligned_alloc_64<int8_t>(nn);
+        int32_t* c = aligned_alloc_64<int32_t>(nn);
+        fill_matrix_int8(a, size, 1);
+        fill_matrix_int8(b, size, 2);
         r = bench_callable([&]() { gemm_int8_blocked(a, b, c, size); }, size, opt.warmup, repeats);
+        row.unit = "CPU kernel";
+        add_note("int32 accumulate");
+        add_note("fallback=blocked (no I8MM)");
+        std::free(a);
+        std::free(b);
+        std::free(c);
       }
-      row.unit = fast ? "CPU NEON" : "CPU kernel";
-      add_note("int32 accumulate");
-      if (!fast) add_note("fallback=blocked");
-      std::free(a);
-      std::free(b);
-      std::free(bt);
-      std::free(c);
     }
 
     row.n = size;
@@ -1215,6 +1620,21 @@ int main(int argc, char** argv) {
           printed.push_back(row);
         }
         if (stop) break;
+      } else if (opt.unit == Options::Unit::NPU) {
+        for (Precision p : opt.precisions) {
+          BenchRow row;
+          row.n = size;
+          row.watts = watts;
+          row.note = note;
+          std::string err;
+          if (!run_one_npu(size, p, row, err)) {
+            row.precision = p;
+            row.unit = "NPU (private ANE)";
+            row.note = err;
+          }
+          print_row(row, show_watts);
+          printed.push_back(row);
+        }
       } else {
         std::cout << std::flush;
         const bool run_amx = (opt.mode == Options::Mode::AMX || opt.mode == Options::Mode::Both);
@@ -1264,7 +1684,11 @@ int main(int argc, char** argv) {
     std::vector<SweepKey> keys;
     if (opt.unit == Options::Unit::GPU) {
       for (Precision p : opt.precisions) {
-        keys.push_back({(p == Precision::INT8) ? "GPU (Metal)" : "GPU (simdgroup)", p});
+        keys.push_back({(p == Precision::INT8) ? "GPU (MPS QMM)" : "GPU (simdgroup)", p});
+      }
+    } else if (opt.unit == Options::Unit::NPU) {
+      for (Precision p : opt.precisions) {
+        keys.push_back({"NPU (private ANE)", p});
       }
     } else {
       for (Precision p : opt.precisions) {
@@ -1276,10 +1700,12 @@ int main(int argc, char** argv) {
             keys.push_back({"CPU ref", p});
           }
         } else {
-          const bool fast = (p == Precision::FP16) ? cpu_has_fp16()
-                            : (p == Precision::BF16) ? cpu_use_bf16_neon()
-                                                     : cpu_has_dotprod();
-          keys.push_back({fast ? "CPU NEON" : "CPU kernel", p});
+          if (p == Precision::INT8) {
+            keys.push_back({cpu_has_i8mm() ? "CPU I8MM GEMM" : "CPU kernel", p});
+          } else {
+            const bool fast = (p == Precision::FP16) ? cpu_has_fp16() : cpu_use_bf16_neon();
+            keys.push_back({fast ? "CPU NEON" : "CPU kernel", p});
+          }
         }
       }
     }
@@ -1307,6 +1733,7 @@ int main(int argc, char** argv) {
 
     std::optional<double> cached_watts;
     std::string cached_power_note;
+    std::string cached_process_gpu_note;
 
     if (opt.unit == Options::Unit::GPU) {
       std::array<double, 4> baseline = {0.0, 0.0, 0.0, 0.0};
@@ -1347,6 +1774,82 @@ int main(int argc, char** argv) {
           print_row(row, show_watts);
         }
         if (stop) break;
+      }
+      return 0;
+    }
+
+    if (opt.unit == Options::Unit::NPU) {
+      std::array<double, 4> baseline = {0.0, 0.0, 0.0, 0.0};
+      std::array<int, 4> throttle_streak = {0, 0, 0, 0};
+      auto sample_power_async = [&]() {
+        return std::async(std::launch::async, [&]() {
+          std::string note;
+          auto watts = get_watts(note);
+          return std::make_pair(watts, note);
+        });
+      };
+      auto sample_process_gpu_async = [&]() {
+        return std::async(std::launch::async, [&]() {
+          std::string note;
+          auto gpu_ms = read_process_gpu_ms_powermetrics(note);
+          return std::make_pair(gpu_ms, note);
+        });
+      };
+
+      for (int iter = 0; iter < opt.stress; iter++) {
+        for (Precision p : opt.precisions) {
+          BenchRow row;
+          row.n = n;
+          row.note = "iter=" + std::to_string(iter);
+
+          const bool sample_power =
+              show_watts && (iter % opt.power_every == 0 || !cached_watts.has_value());
+          std::future<std::pair<std::optional<double>, std::string>> power_future;
+          std::future<std::pair<std::optional<double>, std::string>> process_gpu_future;
+          if (sample_power) {
+            power_future = sample_power_async();
+            process_gpu_future = sample_process_gpu_async();
+          }
+
+          std::string err;
+          const bool ok = run_one_npu(n, p, row, err);
+
+          if (sample_power) {
+            auto sampled = power_future.get();
+            cached_watts = sampled.first;
+            cached_power_note = sampled.second;
+            auto process_gpu = process_gpu_future.get();
+            cached_process_gpu_note = process_gpu.second;
+          }
+          if (show_watts) {
+            row.watts = cached_watts;
+            if (!cached_power_note.empty()) {
+              if (!row.note.empty()) row.note += " | ";
+              row.note += cached_power_note;
+            }
+            if (!cached_process_gpu_note.empty()) {
+              if (!row.note.empty()) row.note += " | ";
+              row.note += cached_process_gpu_note;
+            }
+          }
+
+          if (!ok) {
+            row.precision = p;
+            row.unit = "NPU (private ANE)";
+            row.note = err;
+            if (!cached_power_note.empty()) row.note += " | " + cached_power_note;
+            if (!cached_process_gpu_note.empty()) row.note += " | " + cached_process_gpu_note;
+            print_row(row, show_watts);
+            continue;
+          }
+
+          const int idx = precision_index(p);
+          baseline[idx] = std::max(baseline[idx], row.tflops);
+          if (baseline[idx] > 0.0 && row.tflops < baseline[idx] * 0.9) throttle_streak[idx]++;
+          else throttle_streak[idx] = 0;
+          row.throttling = (throttle_streak[idx] >= 2);
+          print_row(row, show_watts);
+        }
       }
       return 0;
     }
@@ -1401,7 +1904,26 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  std::cout << "CPU (FP32 Accelerate cblas + NEON/typed kernels)\n";
+  if (opt.unit == Options::Unit::NPU) {
+    std::cout << "NPU/ANE private benchmark (conv1x1-chain; N=channels)\n";
+    print_table_header(false);
+    bool any_fail = false;
+    for (Precision p : opt.precisions) {
+      BenchRow row;
+      std::string err;
+      if (!run_one_npu(n, p, row, err)) {
+        row.n = n;
+        row.unit = "NPU (private ANE)";
+        row.precision = p;
+        row.note = err;
+        any_fail = true;
+      }
+      print_row(row, false);
+    }
+    return any_fail ? 2 : 0;
+  }
+
+  std::cout << "CPU (FP32 Accelerate cblas + FP16 NEON + BF16 typed + INT8 I8MM GEMM)\n";
   print_env_hint();
   std::cout << "\n";
 

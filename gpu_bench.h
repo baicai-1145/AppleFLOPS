@@ -46,6 +46,7 @@ struct GpuBenchResult {
   double best_seconds = 0.0;  // GPUStart/GPUEndTime 计算得到的 GPU 硬件时间
   double score = 0.0;  // FP/BF16: TFLOPS, INT8: TOPS
   GpuKernelVariant used_kernel = GpuKernelVariant::Auto;
+  std::string backend;
 };
 
 // 返回 true 表示运行成功；失败时 error 会带原因（例如 shader 编译失败、设备不支持等）。

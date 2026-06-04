@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include "gpu_bench.h"
 
@@ -121,6 +122,125 @@ static NSString* ns_error(NSError* e) {
   return [NSString stringWithFormat:@"%@ (code=%ld)", e.localizedDescription, (long)e.code];
 }
 
+static bool run_mps_int8_qmm(const GpuBenchOptions& opt, id<MTLDevice> device,
+                             id<MTLCommandQueue> queue, GpuBenchResult& out,
+                             std::string& error) {
+  if (@available(macOS 15.0, *)) {
+    const int n = opt.n;
+    const size_t nn = static_cast<size_t>(n) * static_cast<size_t>(n);
+    std::vector<int8_t> a(nn);
+    std::vector<int8_t> b(nn);
+    fill_int8(a.data(), n, 1);
+    fill_int8(b.data(), n, 2);
+
+    NSUInteger dims[2] = {static_cast<NSUInteger>(n), static_cast<NSUInteger>(n)};
+    MPSNDArrayDescriptor* inputDesc =
+        [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeInt8 dimensionCount:2 dimensionSizes:dims];
+    MPSNDArrayDescriptor* outputDesc =
+        [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeInt32 dimensionCount:2 dimensionSizes:dims];
+    if (!inputDesc || !outputDesc) {
+      error = "failed to create MPSNDArrayDescriptor";
+      return false;
+    }
+    inputDesc.preferPackedRows = YES;
+    outputDesc.preferPackedRows = YES;
+
+    MPSNDArray* A = [[MPSNDArray alloc] initWithDevice:device descriptor:inputDesc];
+    MPSNDArray* B = [[MPSNDArray alloc] initWithDevice:device descriptor:inputDesc];
+    MPSNDArray* C = [[MPSNDArray alloc] initWithDevice:device descriptor:outputDesc];
+    MPSNDArray* scaleA = [[MPSNDArray alloc] initWithDevice:device scalar:1.0];
+    MPSNDArray* scaleB = [[MPSNDArray alloc] initWithDevice:device scalar:1.0];
+    if (!A || !B || !C || !scaleA || !scaleB) {
+      error = "failed to allocate MPSNDArrays";
+      return false;
+    }
+
+    [A writeBytes:a.data() strideBytes:nil];
+    [B writeBytes:b.data() strideBytes:nil];
+
+    MPSNDArrayAffineQuantizationDescriptor* qA =
+        [[MPSNDArrayAffineQuantizationDescriptor alloc] initWithDataType:MPSDataTypeInt8
+                                                            hasZeroPoint:NO
+                                                             hasMinValue:NO];
+    MPSNDArrayAffineQuantizationDescriptor* qB =
+        [[MPSNDArrayAffineQuantizationDescriptor alloc] initWithDataType:MPSDataTypeInt8
+                                                            hasZeroPoint:NO
+                                                             hasMinValue:NO];
+    MPSNDArrayQuantizedMatrixMultiplication* qmm =
+        [[MPSNDArrayQuantizedMatrixMultiplication alloc] initWithDevice:device
+                                             leftQuantizationDescriptor:qA
+                                            rightQuantizationDescriptor:qB];
+    if (!qA || !qB || !qmm) {
+      error = "failed to create MPSNDArrayQuantizedMatrixMultiplication";
+      return false;
+    }
+    qmm.beta = 0.0;
+
+    NSArray<MPSNDArray*>* sources = @[ A, B, scaleA, scaleB ];
+    const int64_t encode_count = static_cast<int64_t>(opt.batch) * static_cast<int64_t>(opt.inner);
+    if (encode_count <= 0) {
+      error = "batch*inner overflowed";
+      return false;
+    }
+
+    auto encode_qmm = [&](id<MTLCommandBuffer> cb) {
+      for (int64_t i = 0; i < encode_count; i++) {
+        [qmm encodeToCommandBuffer:cb sourceArrays:sources destinationArray:C];
+      }
+    };
+
+    for (int i = 0; i < opt.warmup; i++) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      encode_qmm(cb);
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        NSError* e = cb.error;
+        error = "MPS QMM warmup command buffer failed: " +
+                std::string([[ns_error(e) description] UTF8String]);
+        return false;
+      }
+    }
+
+    double best = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < opt.repeats; i++) {
+      id<MTLCommandBuffer> cb = [queue commandBuffer];
+      encode_qmm(cb);
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        NSError* e = cb.error;
+        error = "MPS QMM command buffer failed: " + std::string([[ns_error(e) description] UTF8String]);
+        return false;
+      }
+      const double dt = cb.GPUEndTime - cb.GPUStartTime;
+      if (!(dt > 0.0) || !std::isfinite(dt)) {
+        error = "GPUStartTime/GPUEndTime unavailable for MPS QMM (dt <= 0).";
+        return false;
+      }
+      best = std::min(best, dt);
+    }
+
+    if (opt.readback_c) {
+      std::vector<int32_t> c_i32(nn);
+      [C readBytes:c_i32.data() strideBytes:nil];
+      opt.readback_c->resize(nn);
+      for (size_t i = 0; i < nn; i++) {
+        (*opt.readback_c)[i] = static_cast<float>(c_i32[i]);
+      }
+    }
+
+    out.best_seconds = best;
+    out.score = score_for_gemm(n, opt.batch, opt.inner, best);
+    out.used_kernel = GpuKernelVariant::Auto;
+    out.backend = "mps-qmm-i32";
+    return true;
+  }
+
+  error = "MPS INT8 QMM requires macOS 15.0 or newer";
+  return false;
+}
+
 struct MetalCache {
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> queue = nil;
@@ -220,6 +340,17 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
       return false;
     }
 
+    if (!c.queue) c.queue = [device newCommandQueue];
+    id<MTLCommandQueue> queue = c.queue;
+    if (!queue) {
+      error = "failed to create MTLCommandQueue";
+      return false;
+    }
+
+    if (opt.workload == GpuWorkload::Gemm && opt.precision == GpuPrecision::INT8) {
+      return run_mps_int8_qmm(opt, device, queue, out, error);
+    }
+
     NSError* nsErr = nil;
     time_t mt = 0;
     if (!file_mtime(opt.shader_path, mt)) {
@@ -260,13 +391,6 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
       c.pso_peak_bf16 = c.pso_peak_int8 = nil;
     }
     id<MTLLibrary> lib = c.lib;
-
-    if (!c.queue) c.queue = [device newCommandQueue];
-    id<MTLCommandQueue> queue = c.queue;
-    if (!queue) {
-      error = "failed to create MTLCommandQueue";
-      return false;
-    }
 
     const int n = opt.n;
     const size_t bytes_fp32 = static_cast<size_t>(n) * static_cast<size_t>(n) * sizeof(float);
@@ -529,6 +653,7 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
       out.best_seconds = best;
       out.score = score_for_peak(opt.precision, n, opt.batch, opt.inner, best);
       out.used_kernel = GpuKernelVariant::Auto;
+      out.backend = (opt.precision == GpuPrecision::INT8) ? "metal-scalar" : "metal-simdgroup";
       return true;
     }
 
@@ -596,6 +721,7 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
     out.best_seconds = best;
     out.score = score_for_gemm(n, opt.batch, opt.inner, best);
     out.used_kernel = chosen;
+    out.backend = (opt.precision == GpuPrecision::INT8) ? "metal-scalar" : "metal-simdgroup";
 
     if (opt.readback_c) {
       if (opt.workload != GpuWorkload::Gemm) {
