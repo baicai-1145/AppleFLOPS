@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import <TargetConditionals.h>
 
 #include "gpu_bench.h"
 
@@ -125,6 +126,7 @@ static NSString* ns_error(NSError* e) {
 static bool run_mps_int8_qmm(const GpuBenchOptions& opt, id<MTLDevice> device,
                              id<MTLCommandQueue> queue, GpuBenchResult& out,
                              std::string& error) {
+#if TARGET_OS_OSX
   if (@available(macOS 15.0, *)) {
     const int n = opt.n;
     const size_t nn = static_cast<size_t>(n) * static_cast<size_t>(n);
@@ -239,6 +241,14 @@ static bool run_mps_int8_qmm(const GpuBenchOptions& opt, id<MTLDevice> device,
 
   error = "MPS INT8 QMM requires macOS 15.0 or newer";
   return false;
+#else
+  (void)opt;
+  (void)device;
+  (void)queue;
+  (void)out;
+  error = "MPS INT8 QMM path is only enabled for macOS in this runner";
+  return false;
+#endif
 }
 
 struct MetalCache {
@@ -327,10 +337,12 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
     auto& c = cache();
     if (!c.device) {
       c.device = MTLCreateSystemDefaultDevice();
+#if TARGET_OS_OSX
       if (!c.device) {
         NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
         if (devices.count > 0) c.device = devices[0];
       }
+#endif
     }
     id<MTLDevice> device = c.device;
     if (!device) {
@@ -367,7 +379,7 @@ bool run_gpu_bench(const GpuBenchOptions& opt, GpuBenchResult& out, std::string&
         return false;
       }
       MTLCompileOptions* compileOpt = [[MTLCompileOptions alloc] init];
-      if (@available(macOS 15.0, *)) {
+      if (@available(iOS 18.0, macOS 15.0, *)) {
         compileOpt.mathMode = MTLMathModeFast;
         compileOpt.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsFast;
       } else {

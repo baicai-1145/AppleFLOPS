@@ -1,5 +1,23 @@
 #import <Foundation/Foundation.h>
+#import <TargetConditionals.h>
+#if TARGET_OS_OSX
 #import <IOSurface/IOSurface.h>
+#else
+#import <CoreFoundation/CoreFoundation.h>
+typedef CFTypeRef IOSurfaceRef;
+extern "C" {
+extern const CFStringRef kIOSurfaceWidth;
+extern const CFStringRef kIOSurfaceHeight;
+extern const CFStringRef kIOSurfaceBytesPerElement;
+extern const CFStringRef kIOSurfaceBytesPerRow;
+extern const CFStringRef kIOSurfaceAllocSize;
+extern const CFStringRef kIOSurfacePixelFormat;
+extern IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
+extern int IOSurfaceLock(IOSurfaceRef buffer, uint32_t options, uint32_t* seed);
+extern void* IOSurfaceGetBaseAddress(IOSurfaceRef buffer);
+extern int IOSurfaceUnlock(IOSurfaceRef buffer, uint32_t options, uint32_t* seed);
+}
+#endif
 #import <objc/message.h>
 #import <objc/runtime.h>
 
