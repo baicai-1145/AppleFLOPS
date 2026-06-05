@@ -1,7 +1,7 @@
 #import <Foundation/Foundation.h>
 
-typedef void (^MTFLOPSProgressBlock)(NSString* text);
+typedef void (^AppleFLOPSProgressBlock)(NSString* text);
 
-NSDictionary* RunIOSBenchmarks(MTFLOPSProgressBlock progress);
+NSDictionary* RunIOSBenchmarks(AppleFLOPSProgressBlock progress);
 NSString* FormatBenchmarkReport(NSDictionary* result);
 NSURL* WriteBenchmarkResult(NSDictionary* result, NSError** error);

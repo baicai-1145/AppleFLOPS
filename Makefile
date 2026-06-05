@@ -1,6 +1,6 @@
 CXX := clang++
 
-TARGET := mtflops
+TARGET := appleflops
 BUILD_DIR := build
 OBJS := $(BUILD_DIR)/main.o $(BUILD_DIR)/gpu_bench.o $(BUILD_DIR)/npu_bench.o
 

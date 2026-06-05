@@ -1,0 +1,48 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  macos-arm64-release:
+    name: macOS arm64 release
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: make clean all
+
+      - name: Smoke test
+        run: |
+          ./appleflops --unit cpu --precision fp32 --n 128 --warmup 0 --repeats 1 --verify 0
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          rm -rf dist/AppleFLOPS-macos-arm64 dist/AppleFLOPS-macos-arm64.zip
+          mkdir -p dist/AppleFLOPS-macos-arm64/shaders
+          cp appleflops README.md LICENSE dist/AppleFLOPS-macos-arm64/
+          cp shaders/gemm.metal dist/AppleFLOPS-macos-arm64/shaders/
+          (cd dist && zip -r AppleFLOPS-macos-arm64.zip AppleFLOPS-macos-arm64)
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="auto-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          TITLE="AppleFLOPS ${GITHUB_SHA::7}"
+          NOTES=$'Automated release from push.\n\nCommit: '"${GITHUB_SHA}"$'\nBranch: '"${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            dist/AppleFLOPS-macos-arm64.zip \
+            --title "$TITLE" \
+            --notes "$NOTES"

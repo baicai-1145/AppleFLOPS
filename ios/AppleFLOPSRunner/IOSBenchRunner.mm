@@ -65,8 +65,8 @@ int env_int_or_zero(const char* name) {
 }
 
 int cpu_sme_thread_count() {
-  if (int v = env_int_or_zero("MTFLOPS_IOS_CPU_SME_THREADS")) return v;
-  if (int v = env_int_or_zero("MTFLOPS_CPU_THREADS")) return v;
+  if (int v = env_int_or_zero("APPLEFLOPS_IOS_CPU_SME_THREADS")) return v;
+  if (int v = env_int_or_zero("APPLEFLOPS_CPU_THREADS")) return v;
   return cpu_thread_count() * 8;
 }
 
@@ -507,7 +507,7 @@ NSDictionary* run_cpu_sme_peak_one(CpuPrecision p, NSString* name, NSString* met
                   cpu_sme_note(p, inner, threads, lanes32));
 }
 
-NSArray* run_cpu_sme_benches(MTFLOPSProgressBlock progress) {
+NSArray* run_cpu_sme_benches(AppleFLOPSProgressBlock progress) {
   NSMutableArray* rows = [NSMutableArray array];
   if (progress) progress(@"CPU SME FP32");
   [rows addObject:run_cpu_sme_peak_one(CpuPrecision::FP32, @"FP32", @"TFLOPS")];
@@ -690,7 +690,7 @@ NSDictionary* run_cpu_int8() {
   return make_error_row(@"CPU NEON", @"INT8", @"hw.optional.arm.FEAT_I8MM/DotProd is not available");
 }
 
-NSArray* run_cpu_benches(MTFLOPSProgressBlock progress) {
+NSArray* run_cpu_benches(AppleFLOPSProgressBlock progress) {
   if (has_arm_feature("hw.optional.arm.FEAT_SME")) {
     return run_cpu_sme_benches(progress);
   }
@@ -727,7 +727,7 @@ NSDictionary* run_gpu_one(GpuPrecision p, NSString* name, NSString* shaderPath) 
                                              out.backend.c_str(), opt.n, opt.inner, opt.batch]);
 }
 
-NSArray* run_gpu_benches(MTFLOPSProgressBlock progress) {
+NSArray* run_gpu_benches(AppleFLOPSProgressBlock progress) {
   NSString* shaderPath = [[NSBundle mainBundle] pathForResource:@"gemm" ofType:@"metal"];
   NSMutableArray* rows = [NSMutableArray array];
   if (!shaderPath) {
@@ -761,7 +761,7 @@ NSDictionary* run_npu_one(NpuPrecision p, NSString* name, NSString* metric) {
                   [NSString stringWithFormat:@"%s | %s", out.backend.c_str(), out.note.c_str()]);
 }
 
-NSArray* run_npu_benches(MTFLOPSProgressBlock progress) {
+NSArray* run_npu_benches(AppleFLOPSProgressBlock progress) {
   NSMutableArray* rows = [NSMutableArray array];
   if (progress) progress(@"NPU FP16");
   [rows addObject:run_npu_one(NpuPrecision::FP16, @"FP16", @"TFLOPS")];
@@ -774,7 +774,7 @@ NSArray* run_npu_benches(MTFLOPSProgressBlock progress) {
 
 }  // namespace
 
-NSDictionary* RunIOSBenchmarks(MTFLOPSProgressBlock progress) {
+NSDictionary* RunIOSBenchmarks(AppleFLOPSProgressBlock progress) {
   NSMutableArray* rows = [NSMutableArray array];
   if (progress) progress(@"Starting CPU");
   [rows addObjectsFromArray:run_cpu_benches(progress)];
@@ -793,7 +793,7 @@ NSDictionary* RunIOSBenchmarks(MTFLOPSProgressBlock progress) {
   }
 
   return @{
-    @"tool" : @"MTFLOPS iOS Runner",
+    @"tool" : @"AppleFLOPS iOS Runner",
     @"timestamp" : @([[NSDate date] timeIntervalSince1970]),
     @"device" : @{
       @"name" : @"redacted",
@@ -809,7 +809,7 @@ NSDictionary* RunIOSBenchmarks(MTFLOPSProgressBlock progress) {
 NSString* FormatBenchmarkReport(NSDictionary* result) {
   NSMutableString* s = [NSMutableString string];
   NSDictionary* device = result[@"device"];
-  [s appendFormat:@"MTFLOPS iOS Runner\n%@ %@ (%@)\n\n",
+  [s appendFormat:@"AppleFLOPS iOS Runner\n%@ %@ (%@)\n\n",
                   device[@"systemName"], device[@"systemVersion"], device[@"model"]];
   [s appendFormat:@"%-18s %-6s %10s %-7s %8s  %s\n",
                   "Unit", "Prec", "Score", "Metric", "ms", "Note"];
@@ -830,7 +830,7 @@ NSURL* WriteBenchmarkResult(NSDictionary* result, NSError** error) {
   if (!data) return nil;
   NSURL* docs = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory
                                                        inDomains:NSUserDomainMask] firstObject];
-  NSURL* url = [docs URLByAppendingPathComponent:@"mtflops-ios-results.json"];
+  NSURL* url = [docs URLByAppendingPathComponent:@"appleflops-ios-results.json"];
   if (![data writeToURL:url options:NSDataWritingAtomic error:error]) return nil;
   return url;
 }

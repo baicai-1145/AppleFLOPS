@@ -8,8 +8,8 @@
 
 /* Begin PBXBuildFile section */
 		100000000000000000000101 /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000001 /* main.m */; };
-		100000000000000000000102 /* MTFLOPSAppDelegate.mm in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000002 /* MTFLOPSAppDelegate.mm */; };
-		100000000000000000000103 /* MTFLOPSViewController.mm in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000003 /* MTFLOPSViewController.mm */; };
+		100000000000000000000102 /* AppleFLOPSAppDelegate.mm in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000002 /* AppleFLOPSAppDelegate.mm */; };
+		100000000000000000000103 /* AppleFLOPSViewController.mm in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000003 /* AppleFLOPSViewController.mm */; };
 		100000000000000000000104 /* IOSBenchRunner.mm in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000004 /* IOSBenchRunner.mm */; };
 		100000000000000000000105 /* gpu_bench.mm in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000005 /* gpu_bench.mm */; };
 		100000000000000000000106 /* npu_bench.mm in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000006 /* npu_bench.mm */; };
@@ -23,14 +23,14 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		100000000000000000000001 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = MTFLOPSRunner/main.m; sourceTree = "<group>"; };
-		100000000000000000000002 /* MTFLOPSAppDelegate.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = MTFLOPSRunner/MTFLOPSAppDelegate.mm; sourceTree = "<group>"; };
-		100000000000000000000003 /* MTFLOPSViewController.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = MTFLOPSRunner/MTFLOPSViewController.mm; sourceTree = "<group>"; };
-		100000000000000000000004 /* IOSBenchRunner.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = MTFLOPSRunner/IOSBenchRunner.mm; sourceTree = "<group>"; };
-		100000000000000000000011 /* MTFLOPSAppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MTFLOPSRunner/MTFLOPSAppDelegate.h; sourceTree = "<group>"; };
-		100000000000000000000012 /* MTFLOPSViewController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MTFLOPSRunner/MTFLOPSViewController.h; sourceTree = "<group>"; };
-		100000000000000000000013 /* IOSBenchRunner.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MTFLOPSRunner/IOSBenchRunner.h; sourceTree = "<group>"; };
-		100000000000000000000014 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = MTFLOPSRunner/Info.plist; sourceTree = "<group>"; };
+		100000000000000000000001 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AppleFLOPSRunner/main.m; sourceTree = "<group>"; };
+		100000000000000000000002 /* AppleFLOPSAppDelegate.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = AppleFLOPSRunner/AppleFLOPSAppDelegate.mm; sourceTree = "<group>"; };
+		100000000000000000000003 /* AppleFLOPSViewController.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = AppleFLOPSRunner/AppleFLOPSViewController.mm; sourceTree = "<group>"; };
+		100000000000000000000004 /* IOSBenchRunner.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = AppleFLOPSRunner/IOSBenchRunner.mm; sourceTree = "<group>"; };
+		100000000000000000000011 /* AppleFLOPSAppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppleFLOPSRunner/AppleFLOPSAppDelegate.h; sourceTree = "<group>"; };
+		100000000000000000000012 /* AppleFLOPSViewController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppleFLOPSRunner/AppleFLOPSViewController.h; sourceTree = "<group>"; };
+		100000000000000000000013 /* IOSBenchRunner.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppleFLOPSRunner/IOSBenchRunner.h; sourceTree = "<group>"; };
+		100000000000000000000014 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = AppleFLOPSRunner/Info.plist; sourceTree = "<group>"; };
 		100000000000000000000005 /* gpu_bench.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = ../gpu_bench.mm; sourceTree = "<group>"; };
 		100000000000000000000006 /* npu_bench.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = ../npu_bench.mm; sourceTree = "<group>"; };
 		100000000000000000000015 /* gpu_bench.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ../gpu_bench.h; sourceTree = "<group>"; };
@@ -42,7 +42,7 @@
 		10000000000000000000000B /* MetalPerformanceShaders.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalPerformanceShaders.framework; path = System/Library/Frameworks/MetalPerformanceShaders.framework; sourceTree = SDKROOT; };
 		10000000000000000000000C /* IOSurface.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOSurface.framework; path = System/Library/Frameworks/IOSurface.framework; sourceTree = SDKROOT; };
 		10000000000000000000000D /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
-		100000000000000000000020 /* MTFLOPSRunner.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MTFLOPSRunner.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		100000000000000000000020 /* AppleFLOPSRunner.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppleFLOPSRunner.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -65,22 +65,22 @@
 		100000000000000000000040 = {
 			isa = PBXGroup;
 			children = (
-				100000000000000000000041 /* MTFLOPSRunner */,
+				100000000000000000000041 /* AppleFLOPSRunner */,
 				100000000000000000000042 /* Shared */,
 				100000000000000000000043 /* Frameworks */,
 				100000000000000000000044 /* Products */,
 			);
 			sourceTree = "<group>";
 		};
-		100000000000000000000041 /* MTFLOPSRunner */ = {
+		100000000000000000000041 /* AppleFLOPSRunner */ = {
 			isa = PBXGroup;
 			children = (
 				100000000000000000000014 /* Info.plist */,
 				100000000000000000000001 /* main.m */,
-				100000000000000000000011 /* MTFLOPSAppDelegate.h */,
-				100000000000000000000002 /* MTFLOPSAppDelegate.mm */,
-				100000000000000000000012 /* MTFLOPSViewController.h */,
-				100000000000000000000003 /* MTFLOPSViewController.mm */,
+				100000000000000000000011 /* AppleFLOPSAppDelegate.h */,
+				100000000000000000000002 /* AppleFLOPSAppDelegate.mm */,
+				100000000000000000000012 /* AppleFLOPSViewController.h */,
+				100000000000000000000003 /* AppleFLOPSViewController.mm */,
 				100000000000000000000013 /* IOSBenchRunner.h */,
 				100000000000000000000004 /* IOSBenchRunner.mm */,
 			);
@@ -112,16 +112,16 @@
 		100000000000000000000044 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				100000000000000000000020 /* MTFLOPSRunner.app */,
+				100000000000000000000020 /* AppleFLOPSRunner.app */,
 			);
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		100000000000000000000050 /* MTFLOPSRunner */ = {
+		100000000000000000000050 /* AppleFLOPSRunner */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 100000000000000000000090 /* Build configuration list for PBXNativeTarget "MTFLOPSRunner" */;
+			buildConfigurationList = 100000000000000000000090 /* Build configuration list for PBXNativeTarget "AppleFLOPSRunner" */;
 			buildPhases = (
 				100000000000000000000060 /* Sources */,
 				100000000000000000000030 /* Frameworks */,
@@ -131,9 +131,9 @@
 			);
 			dependencies = (
 			);
-			name = MTFLOPSRunner;
-			productName = MTFLOPSRunner;
-			productReference = 100000000000000000000020 /* MTFLOPSRunner.app */;
+			name = AppleFLOPSRunner;
+			productName = AppleFLOPSRunner;
+			productReference = 100000000000000000000020 /* AppleFLOPSRunner.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -150,7 +150,7 @@
 					};
 				};
 			};
-			buildConfigurationList = 100000000000000000000081 /* Build configuration list for PBXProject "MTFLOPSRunner" */;
+			buildConfigurationList = 100000000000000000000081 /* Build configuration list for PBXProject "AppleFLOPSRunner" */;
 			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -163,7 +163,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				100000000000000000000050 /* MTFLOPSRunner */,
+				100000000000000000000050 /* AppleFLOPSRunner */,
 			);
 		};
 /* End PBXProject section */
@@ -185,8 +185,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				100000000000000000000101 /* main.m in Sources */,
-				100000000000000000000102 /* MTFLOPSAppDelegate.mm in Sources */,
-				100000000000000000000103 /* MTFLOPSViewController.mm in Sources */,
+				100000000000000000000102 /* AppleFLOPSAppDelegate.mm in Sources */,
+				100000000000000000000103 /* AppleFLOPSViewController.mm in Sources */,
 				100000000000000000000104 /* IOSBenchRunner.mm in Sources */,
 				100000000000000000000105 /* gpu_bench.mm in Sources */,
 				100000000000000000000106 /* npu_bench.mm in Sources */,
@@ -235,10 +235,10 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = "";
 				CODE_SIGN_ENTITLEMENTS = "";
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = MTFLOPSRunner/Info.plist;
+				INFOPLIST_FILE = AppleFLOPSRunner/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.mtflops.runner;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.appleflops.runner;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = iphoneos;
 				SUPPORTS_MACCATALYST = NO;
@@ -253,10 +253,10 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = "";
 				CODE_SIGN_ENTITLEMENTS = "";
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = MTFLOPSRunner/Info.plist;
+				INFOPLIST_FILE = AppleFLOPSRunner/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.mtflops.runner;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.appleflops.runner;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = iphoneos;
 				SUPPORTS_MACCATALYST = NO;
@@ -268,7 +268,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		100000000000000000000081 /* Build configuration list for PBXProject "MTFLOPSRunner" */ = {
+		100000000000000000000081 /* Build configuration list for PBXProject "AppleFLOPSRunner" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				100000000000000000000082 /* Debug */,
@@ -277,7 +277,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		100000000000000000000090 /* Build configuration list for PBXNativeTarget "MTFLOPSRunner" */ = {
+		100000000000000000000090 /* Build configuration list for PBXNativeTarget "AppleFLOPSRunner" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				100000000000000000000091 /* Debug */,

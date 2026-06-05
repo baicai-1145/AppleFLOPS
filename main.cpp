@@ -182,9 +182,9 @@ Options parse_args(int argc, char** argv) {
 
     if (a == "-h" || a == "--help") {
       std::cout
-          << "MTFLOPS (CPU SME + Metal GPU + private ANE)\n\n"
+          << "AppleFLOPS (CPU SME + Metal GPU + private ANE)\n\n"
           << "Usage:\n"
-          << "  ./mtflops [--unit cpu|gpu|npu|all] [--mode amx|ref|both] [--precision fp16|fp32|bf16|int8|both|all]\n"
+          << "  ./appleflops [--unit cpu|gpu|npu|all] [--mode amx|ref|both] [--precision fp16|fp32|bf16|int8|both|all]\n"
           << "           [--n N] [--warmup W] [--repeats R] [--verify 0|1]\n"
           << "           [--shader <path>]\n\n"
           << "           [--sweep 0|1] [--sweep-min N] [--sweep-max N]\n"
@@ -815,7 +815,7 @@ int cpu_sme_hardware_thread_count() {
 }
 
 int cpu_sme_thread_count() {
-  if (const char* env = std::getenv("MTFLOPS_CPU_THREADS")) {
+  if (const char* env = std::getenv("APPLEFLOPS_CPU_THREADS")) {
     int v = 0;
     if (parse_int(env, v) && v > 0) return v;
   }
@@ -825,7 +825,7 @@ int cpu_sme_thread_count() {
 }
 
 bool cpu_sme_threads_env_set() {
-  return std::getenv("MTFLOPS_CPU_THREADS") != nullptr;
+  return std::getenv("APPLEFLOPS_CPU_THREADS") != nullptr;
 }
 
 struct ScopedCpuSmeThreadOverride {
@@ -1272,14 +1272,13 @@ int64_t max_abs_diff_i32(const int32_t* x, const int32_t* y, int n) {
 }
 
 void print_logo() {
-  // 纯文本标题用于避免不同终端字体下的 ASCII Art 误读（例如把 T 看成 F）。
-  std::cout << "MTFLOPS\n";
-  std::cout << " __  __ _______ ______ _      ____  _____   _____ \n";
-  std::cout << "|  \\/  |__   __|  ____| |    / __ \\|  __ \\ / ____|\n";
-  std::cout << "| \\  / |  | |  | |__  | |   | |  | | |__) | (___  \n";
-  std::cout << "| |\\/| |  | |  |  __| | |   | |  | |  ___/ \\___ \\ \n";
-  std::cout << "| |  | |  | |  | |    | |___| |__| | |     ____) |\n";
-  std::cout << "|_|  |_|  |_|  |_|    |______\\____/|_|    |_____/ \n\n";
+  std::cout << R"(    _    ____  ____  _     _____ _____ _     ___  ____  ____
+   / \  |  _ \|  _ \| |   | ____|  ___| |   / _ \|  _ \/ ___|
+  / _ \ | |_) | |_) | |   |  _| | |_  | |  | | | | |_) \___ \
+ / ___ \|  __/|  __/| |___| |___|  _| | |__| |_| |  __/ ___) |
+/_/   \_\_|   |_|   |_____|_____|_|   |_____\___/|_|   |____/
+)";
+  std::cout << "Apple Silicon FLOPS/TOPS benchmark\n\n";
 }
 
 std::string precision_to_string(Precision p) {
@@ -1485,14 +1484,14 @@ std::optional<double> read_process_gpu_ms_powermetrics(std::string& note) {
   const int rc = run_command_capture(
       "powermetrics --samplers tasks --show-process-gpu -n 1 -i 1000 2>&1", out);
   if (rc == 0) {
-    if (auto gpu = parse_process_gpu_ms_s(out, "mtflops")) {
+    if (auto gpu = parse_process_gpu_ms_s(out, "appleflops")) {
       char buf[96];
-      std::snprintf(buf, sizeof(buf), "powermetrics(tasks) mtflops_gpu_ms_s=%.2f", *gpu);
+      std::snprintf(buf, sizeof(buf), "powermetrics(tasks) appleflops_gpu_ms_s=%.2f", *gpu);
       note = buf;
       return gpu;
     }
   }
-  note = "powermetrics 未解析到 mtflops GPU ms/s";
+  note = "powermetrics 未解析到 appleflops GPU ms/s";
   return std::nullopt;
 }
 
@@ -2542,7 +2541,7 @@ int main(int argc, char** argv) {
   }
 
   std::cout << "CPU (SME MOPA peak probe: FP32/FP16/BF16/INT8)\n";
-  std::cout << "hint: CPU --n controls SME inner loop scale; MTFLOPS_CPU_THREADS overrides worker count.\n";
+  std::cout << "hint: CPU --n controls SME inner loop scale; APPLEFLOPS_CPU_THREADS overrides worker count.\n";
   std::cout << "\n";
 
   if (opt.verify) {

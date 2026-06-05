@@ -1,14 +1,14 @@
-#import "MTFLOPSViewController.h"
+#import "AppleFLOPSViewController.h"
 
 #import "IOSBenchRunner.h"
 
-@interface MTFLOPSViewController ()
+@interface AppleFLOPSViewController ()
 @property(nonatomic, strong) UITextView* textView;
 @property(nonatomic, strong) UIButton* runButton;
 @property(nonatomic, assign) BOOL running;
 @end
 
-@implementation MTFLOPSViewController
+@implementation AppleFLOPSViewController
 
 - (void)viewDidLoad {
   [super viewDidLoad];
@@ -68,8 +68,8 @@
     NSURL* url = WriteBenchmarkResult(result, &error);
     NSString* report = FormatBenchmarkReport(result);
     NSLog(@"\n%@", report);
-    if (url) NSLog(@"MTFLOPS result JSON: %@", url.path);
-    else NSLog(@"Failed to write MTFLOPS result JSON: %@", error);
+    if (url) NSLog(@"AppleFLOPS result JSON: %@", url.path);
+    else NSLog(@"Failed to write AppleFLOPS result JSON: %@", error);
 
     dispatch_async(dispatch_get_main_queue(), ^{
       self.textView.text = report;

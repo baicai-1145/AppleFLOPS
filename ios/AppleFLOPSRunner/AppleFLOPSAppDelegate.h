@@ -1,6 +1,6 @@
 #import <UIKit/UIKit.h>
 
-@interface MTFLOPSAppDelegate : UIResponder <UIApplicationDelegate>
+@interface AppleFLOPSAppDelegate : UIResponder <UIApplicationDelegate>
 
 @property(strong, nonatomic) UIWindow* window;
 

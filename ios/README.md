@@ -1,4 +1,4 @@
-# MTFLOPS iOS Runner
+# AppleFLOPS iOS Runner
 
 This directory contains a minimal iPhone runner for measuring local CPU, GPU, and ANE/NPU compute from the same benchmark codebase.
 
@@ -7,8 +7,8 @@ This directory contains a minimal iPhone runner for measuring local CPU, GPU, an
 Compile-only check, no signing or install:
 
 ```sh
-xcodebuild -project ios/MTFLOPSRunner.xcodeproj \
-  -scheme MTFLOPSRunner \
+xcodebuild -project ios/AppleFLOPSRunner.xcodeproj \
+  -scheme AppleFLOPSRunner \
   -configuration Release \
   -sdk iphoneos \
   CODE_SIGNING_ALLOWED=NO \
@@ -18,19 +18,19 @@ xcodebuild -project ios/MTFLOPSRunner.xcodeproj \
 Build for the connected iPhone:
 
 ```sh
-xcodebuild -project ios/MTFLOPSRunner.xcodeproj \
-  -scheme MTFLOPSRunner \
+xcodebuild -project ios/AppleFLOPSRunner.xcodeproj \
+  -scheme AppleFLOPSRunner \
   -configuration Release \
   -destination 'id=<iphone-udid>' \
   -allowProvisioningUpdates \
   build
 ```
 
-The default bundle id is `com.example.mtflops.runner`. For a real device build, set your own bundle identifier and development team in Xcode, or pass signing settings on the `xcodebuild` command line.
+The default bundle id is `com.example.appleflops.runner`. For a real device build, set your own bundle identifier and development team in Xcode, or pass signing settings on the `xcodebuild` command line.
 
 ## Run
 
-Open `ios/MTFLOPSRunner.xcodeproj` in Xcode, select the connected iPhone, then run the `MTFLOPSRunner` scheme. The app starts benchmarks automatically and shows a text report.
+Open `ios/AppleFLOPSRunner.xcodeproj` in Xcode, select the connected iPhone, then run the `AppleFLOPSRunner` scheme. The app starts benchmarks automatically and shows a text report.
 
 If iOS refuses to launch a freshly installed development build, trust the developer profile on the phone first:
 
@@ -41,7 +41,7 @@ Settings -> General -> VPN & Device Management -> Apple Development -> Trust
 The app also writes:
 
 ```text
-Documents/mtflops-ios-results.json
+Documents/appleflops-ios-results.json
 ```
 
 ## Coverage
