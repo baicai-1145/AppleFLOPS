@@ -26,8 +26,19 @@
 #include <vector>
 
 #include <arm_neon.h>
+
+#ifndef __has_include
+#define __has_include(x) 0
+#endif
+
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__clang__) && (__clang_major__ >= 17) && \
+    __has_include(<arm_sme.h>) && __has_include(<arm_sve.h>)
+#define APPLEFLOPS_HAS_CPU_SME_ACLE 1
 #include <arm_sme.h>
 #include <arm_sve.h>
+#else
+#define APPLEFLOPS_HAS_CPU_SME_ACLE 0
+#endif
 
 #include "gpu_bench.h"
 #include "npu_bench.h"
@@ -860,6 +871,7 @@ uint16_t fp32_to_bf16_peak_bits(float f) {
 
 // These kernels are intentionally peak probes, not full GEMM kernels. They run the
 // public SME outer-product instructions directly with stable in-register inputs.
+#if APPLEFLOPS_HAS_CPU_SME_ACLE
 __arm_new("za") __arm_locally_streaming __attribute__((target("sme,bf16,i8mm"), noinline))
 void cpu_sme_peak_fp32_kernel(const float* a, const float* b, float* out, uint64_t inner,
                               uint64_t* ops_per_mopa, uint32_t* lanes32) {
@@ -942,6 +954,11 @@ struct CpuSmeVerifyResult {
 };
 
 RunResult bench_cpu_sme_peak(Precision p, int n, int warmup, int repeats, std::string& note) {
+  if (!cpu_feature_enabled("hw.optional.arm.FEAT_SME")) {
+    note = "CPU SME unavailable: hw.optional.arm.FEAT_SME is not available";
+    return {};
+  }
+
   const uint64_t inner = cpu_sme_peak_inner_from_n(n);
   const int threads = cpu_sme_thread_count();
   uint64_t ops_per_mopa = 0;
@@ -1199,6 +1216,30 @@ CpuSmeVerifyResult verify_cpu_sme_peak(Precision p) {
   std::free(b);
   std::free(out);
   return v;
+}
+#else
+struct CpuSmeVerifyResult {
+  bool ok = false;
+  double diff = 0.0;
+  int64_t diff_i32 = 0;
+};
+
+RunResult bench_cpu_sme_peak(Precision, int, int, int, std::string& note) {
+  note = "CPU SME unavailable: this binary was built without SME ACLE compiler support";
+  return {};
+}
+
+CpuSmeVerifyResult verify_cpu_sme_peak(Precision) {
+  return {};
+}
+#endif
+
+bool cpu_sme_available() {
+#if APPLEFLOPS_HAS_CPU_SME_ACLE
+  return cpu_feature_enabled("hw.optional.arm.FEAT_SME");
+#else
+  return false;
+#endif
 }
 
 template <typename Fn>
@@ -2045,7 +2086,7 @@ int main(int argc, char** argv) {
         for (Precision p : opt.precisions) {
           BenchRow base;
           base.n = size;
-          if (opt.verify) {
+          if (opt.verify && cpu_sme_available()) {
             const CpuSmeVerifyResult verify = verify_cpu_sme_peak(p);
             if (!verify.ok) {
               if (!base.note.empty()) base.note += " | ";
@@ -2478,7 +2519,7 @@ int main(int argc, char** argv) {
 
     for (Precision p : cpu_precisions) {
       if (!selected(p)) continue;
-      if (opt.verify) {
+      if (opt.verify && cpu_sme_available()) {
         const CpuSmeVerifyResult verify = verify_cpu_sme_peak(p);
         if (!verify.ok) {
           std::cout << "verify(cpu_sme_peak): prec=" << precision_to_string(p);
@@ -2544,7 +2585,7 @@ int main(int argc, char** argv) {
   std::cout << "hint: CPU --n controls SME inner loop scale; APPLEFLOPS_CPU_THREADS overrides worker count.\n";
   std::cout << "\n";
 
-  if (opt.verify) {
+  if (opt.verify && cpu_sme_available()) {
     for (Precision p : opt.precisions) {
       const CpuSmeVerifyResult verify = verify_cpu_sme_peak(p);
       std::cout << "verify(cpu_sme_peak): prec=" << precision_to_string(p);
@@ -2556,6 +2597,8 @@ int main(int argc, char** argv) {
       std::cout << (verify.ok ? "\n" : " FAILED\n");
     }
     std::cout << "\n";
+  } else if (opt.verify) {
+    std::cout << "verify(cpu_sme_peak): skipped because CPU SME is unavailable in this binary or host\n\n";
   }
 
   const bool show_watts = (opt.power != Options::Power::None);

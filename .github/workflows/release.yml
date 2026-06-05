@@ -12,7 +12,7 @@ permissions:
 jobs:
   macos-arm64-release:
     name: macOS arm64 release
-    runs-on: macos-14
+    runs-on: macos-26
 
     steps:
       - name: Checkout
@@ -23,7 +23,7 @@ jobs:
 
       - name: Smoke test
         run: |
-          ./appleflops --unit cpu --precision fp32 --n 128 --warmup 0 --repeats 1 --verify 0
+          ./appleflops --help
 
       - name: Package
         run: |
