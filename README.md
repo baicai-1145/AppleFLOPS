@@ -3,14 +3,14 @@
 Apple Silicon / Apple 设备原生算力测试工具，支持 macOS CLI 和 iOS runner，覆盖 CPU/GPU 多精度跑分，并提供 NPU(ANE private) 的 FP16/INT8 peak 跑分与 BF16 probe。
 
 ## 下载（推荐）
-macOS 用户可以直接从 Release 页面下载预编译包 `AppleFLOPS-macos-arm64.zip`：
+直接从 Release 页面下载预编译包 `AppleFLOPS-macos-arm64.zip`：
 ```bash
-curl -L -o AppleFLOPS-macos-arm64.zip https://github.com/<owner>/<repo>/releases/download/v1.0.0/AppleFLOPS-macos-arm64.zip
+curl -L -o AppleFLOPS-macos-arm64.zip https://github.com/baicai-1145/AppleFLOPS/releases/download/auto-2-0623603/AppleFLOPS-macos-arm64.zip
 unzip AppleFLOPS-macos-arm64.zip
 cd AppleFLOPS-macos-arm64
 ```
 
-该 zip 需要包含 `appleflops`、`shaders/gemm.metal`、`README.md` 和 `LICENSE`。如果从源码仓库 `git clone`，则需要先运行 `make` 自行编译。
+如果从源码仓库 `git clone`，则需要先运行 `make` 自行编译。
 
 ## 推荐一键跑分
 一次跑完当前可信支持矩阵：CPU FP32/FP16/BF16/INT8、GPU FP32/FP16/BF16、NPU FP16/INT8：
