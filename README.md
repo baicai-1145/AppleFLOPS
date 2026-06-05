@@ -21,9 +21,7 @@ cd AppleFLOPS-macos-arm64
 
 ## 实测数据
 
-下表是本项目当前记录的本机实测最高点，用于给读者一个量级参考，不代表所有机器、系统版本、散热状态下都能复现。浮点单位是 TFLOPS，INT8 单位是 TOPS。
-
-MacBook Air M4（16GB，macOS，本机记录于 2026-06-05）：
+MacBook Air M4（16GB，macOS 26.5）：
 
 | Unit | FP32 | FP16 | BF16 | INT8 |
 |---|---:|---:|---:|---:|
@@ -31,7 +29,7 @@ MacBook Air M4（16GB，macOS，本机记录于 2026-06-05）：
 | GPU Metal simdgroup | 2.783 | 2.913 | 2.889 | 不记录 |
 | NPU / ANE private | 不记录 | 18.256 | 不记录 | 34.558 |
 
-iPhone 17 / A19（iPhone18,3，iOS 26.5.1，本机记录于 2026-06-06）：
+iPhone 17 / A19（iPhone18,3，iOS 26.5.1）：
 
 | Unit | FP32 | FP16 | BF16 | INT8 |
 |---|---:|---:|---:|---:|
